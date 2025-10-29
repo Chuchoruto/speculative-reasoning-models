@@ -5,19 +5,26 @@ import yaml
 # Define the Modal app
 app = modal.App("coconut-gsm8k-eval")
 
-# Create the image with all dependencies
-image = modal.Image.debian_slim().pip_install([
-    "torch==2.5.1",
-    "numpy==2.1.3", 
-    "transformers==4.46.2",
-    "wandb==0.18.7",
-    "datasets==3.1.0",
-    "tqdm==4.67.0",
-    "pyyaml"
-])
-
-# Mount the code directory
-code_mount = modal.Mount.from_local_dir(".", remote_path="/workspace")
+# Create the image with all dependencies and include project files needed remotely
+image = (
+    modal.Image
+        .debian_slim()
+        .pip_install([
+            "torch==2.5.1",
+            "numpy==2.1.3", 
+            "transformers==4.46.2",
+            "wandb==0.18.7",
+            "datasets==3.1.0",
+            "tqdm==4.67.0",
+            "pyyaml"
+        ])
+        .add_local_file("run.py", "/workspace/run.py")
+        .add_local_file("coconut.py", "/workspace/coconut.py")
+        .add_local_file("dataset.py", "/workspace/dataset.py")
+        .add_local_file("utils.py", "/workspace/utils.py")
+        .add_local_dir("data", "/workspace/data")
+        .add_local_dir("args", "/workspace/args")
+)
 
 # Use the same persistent volume
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
@@ -26,13 +33,12 @@ checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_miss
     image=image,
     gpu="A100:4",
     timeout=60 * 60 * 2,  # 2 hour timeout for evaluation
-    mounts=[code_mount],
     volumes={"/checkpoints": checkpoint_volume},  # Mount same volume
     environment_variables={
-        "WANDB_API_KEY": os.environ["WANDB_API_KEY"],
         "NCCL_DEBUG": "INFO",
         "CUDA_VISIBLE_DEVICES": "0,1,2,3"
-    }
+    },
+    secrets=[modal.Secret.from_name("wandb")],
 )
 def evaluate_model(checkpoint_path: str):
     """Evaluate the trained Coconut model with 4x A100 GPUs"""
