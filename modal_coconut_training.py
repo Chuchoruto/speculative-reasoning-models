@@ -18,6 +18,10 @@ image = (
             "tqdm==4.67.0",
             "pyyaml"
         ])
+        .env({
+            "NCCL_DEBUG": "INFO",
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3"
+        })
         .add_local_file("run.py", "/workspace/run.py")
         .add_local_file("coconut.py", "/workspace/coconut.py")
         .add_local_file("dataset.py", "/workspace/dataset.py")
@@ -34,10 +38,6 @@ checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_miss
     gpu="A100:4",
     timeout=60 * 60 * 24,
     volumes={"/checkpoints": checkpoint_volume},  # Mount same volume
-    environment_variables={
-        "NCCL_DEBUG": "INFO",
-        "CUDA_VISIBLE_DEVICES": "0,1,2,3"
-    },
     secrets=[modal.Secret.from_name("wandb")],
 )
 def train_coconut(cot_checkpoint_path: str):
