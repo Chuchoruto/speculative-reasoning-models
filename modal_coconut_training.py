@@ -69,14 +69,14 @@ def train_coconut(cot_checkpoint_path: str):
         "load_model_path": cot_checkpoint_path,
         "seed": 0,
         "resume": 3,
-        "bf16": False,
+        "bf16": True,
         "train_path": "data/gsm_train.json",
         "val_path": "data/gsm_valid.json",
         "reset_optimizer": True,
-        "batch_size_training": 32,  # Per GPU batch size
+        "batch_size_training": 64,  # Per GPU batch size
         "debug": False,
         "gradient_accumulation_steps": 1,
-        "num_epochs": 25,
+        "num_epochs": 15,
         "lr": 1e-4,
         "weight_decay": 0.01
     }
