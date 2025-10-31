@@ -251,59 +251,8 @@ def download_latest_checkpoint(model_type: str, local_path: str = "./downloaded_
         print(f"❌ Error downloading latest {model_type} checkpoint: {e}")
         return False
 
-@app.function(
-    image=image,
-    volumes={"/checkpoints": checkpoint_volume},
-    timeout=60 * 60 * 2
-)
-def download_draft_training_data(filename: str = None, local_path: str = "./downloaded_checkpoints"):
-    """Download draft training data from the volume"""
-    import os
-    
-    draft_data_path = "/checkpoints/draft_data"
-    local_draft_path = f"{local_path}/draft_data"
-    os.makedirs(local_draft_path, exist_ok=True)
-    
-    try:
-        if not os.path.exists(draft_data_path):
-            print("❌ Draft data directory not found in volume")
-            return False
-        
-        files = os.listdir(draft_data_path)
-        if not files:
-            print("❌ No draft training data files found")
-            return False
-        
-        # Download specific file or all files
-        if filename:
-            if filename not in files:
-                print(f"❌ File '{filename}' not found in draft data directory")
-                print(f"Available files: {', '.join(files)}")
-                return False
-            
-            checkpoint_volume.download(
-                f"{draft_data_path}/{filename}",
-                f"{local_draft_path}/{filename}"
-            )
-            print(f"✅ Successfully downloaded '{filename}' to {local_draft_path}/{filename}")
-            return True
-        else:
-            # Download all files
-            downloaded_count = 0
-            for f in files:
-                checkpoint_volume.download(
-                    f"{draft_data_path}/{f}",
-                    f"{local_draft_path}/{f}"
-                )
-                downloaded_count += 1
-                print(f"✅ Downloaded '{f}'")
-            
-            print(f"✅ Successfully downloaded {downloaded_count} file(s) to {local_draft_path}")
-            return True
-            
-    except Exception as e:
-        print(f"❌ Error downloading draft training data: {e}")
-        return False
+# Note: Modal volumes don't support .download() method in functions.
+# Use the local script download_draft_data.py instead, which uses Modal CLI.
 
 @app.function(
     image=image,
@@ -313,6 +262,7 @@ def download_draft_training_data(filename: str = None, local_path: str = "./down
 def list_draft_training_data():
     """List all available draft training data files in the volume"""
     import os
+    import glob
     
     print("🔍 Available draft training data files:")
     print("=" * 50)
@@ -322,16 +272,72 @@ def list_draft_training_data():
         if os.path.exists(draft_data_path):
             files = os.listdir(draft_data_path)
             if files:
-                print("📁 Draft Training Data:")
-                for f in sorted(files):
-                    # Try to get file size
-                    file_path = os.path.join(draft_data_path, f)
-                    try:
-                        size = os.path.getsize(file_path)
-                        size_mb = size / (1024 * 1024)
-                        print(f"   - {f} ({size_mb:.2f} MB)")
-                    except:
-                        print(f"   - {f}")
+                json_files = [f for f in files if f.endswith('.json')]
+                npz_files = [f for f in files if f.endswith('.npz')]
+                
+                print(f"📁 Draft Training Data:")
+                print(f"   Base volume path: {draft_data_path}")
+                print(f"   JSON metadata files: {len(json_files)}")
+                print(f"   NPZ vector files: {len(npz_files)}")
+                print()
+                
+                # List JSON files with details
+                if json_files:
+                    print("📄 JSON Metadata Files:")
+                    print("   Full volume paths:")
+                    for f in sorted(json_files):
+                        file_path = os.path.join(draft_data_path, f)
+                        full_volume_path = f"{draft_data_path}/{f}"
+                        try:
+                            size = os.path.getsize(file_path)
+                            size_mb = size / (1024 * 1024)
+                            # Count associated NPZ files
+                            base_name = f.replace('.json', '')
+                            npz_count = len(glob.glob(os.path.join(draft_data_path, f"{base_name}_sample_*.npz")))
+                            print(f"   - {full_volume_path}")
+                            print(f"     File: {f} ({size_mb:.2f} MB) → {npz_count} NPZ files")
+                        except:
+                            print(f"   - {full_volume_path}")
+                            print(f"     File: {f}")
+                
+                # Show summary of NPZ files
+                if npz_files:
+                    print()
+                    print("📦 NPZ Vector Files:")
+                    print(f"   Total: {len(npz_files)} files")
+                    print("   Full volume paths:")
+                    if len(npz_files) <= 20:
+                        # Show all if not too many
+                        for f in sorted(npz_files):
+                            file_path = os.path.join(draft_data_path, f)
+                            full_volume_path = f"{draft_data_path}/{f}"
+                            try:
+                                size = os.path.getsize(file_path)
+                                size_kb = size / 1024
+                                print(f"   - {full_volume_path} ({size_kb:.1f} KB)")
+                            except:
+                                print(f"   - {full_volume_path}")
+                    else:
+                        # Show first and last few
+                        for f in sorted(npz_files)[:5]:
+                            file_path = os.path.join(draft_data_path, f)
+                            full_volume_path = f"{draft_data_path}/{f}"
+                            try:
+                                size = os.path.getsize(file_path)
+                                size_kb = size / 1024
+                                print(f"   - {full_volume_path} ({size_kb:.1f} KB)")
+                            except:
+                                print(f"   - {full_volume_path}")
+                        print(f"   ... ({len(npz_files) - 10} more files) ...")
+                        for f in sorted(npz_files)[-5:]:
+                            file_path = os.path.join(draft_data_path, f)
+                            full_volume_path = f"{draft_data_path}/{f}"
+                            try:
+                                size = os.path.getsize(file_path)
+                                size_kb = size / 1024
+                                print(f"   - {full_volume_path} ({size_kb:.1f} KB)")
+                            except:
+                                print(f"   - {full_volume_path}")
             else:
                 print("📁 Draft Training Data: None found")
         else:
@@ -364,8 +370,15 @@ def main():
     print()
     print("📊 Draft Training Data:")
     print("   modal run modal_download.py::list_draft_training_data")
-    print("   modal run modal_download.py::download_draft_training_data --filename 'draft_training_data.json' --local-path './my_checkpoints'")
-    print("   modal run modal_download.py::download_draft_training_data --local-path './my_checkpoints'  # Downloads all files")
+    print()
+    print("   To download, use the local script (requires Modal CLI):")
+    print("   python download_draft_data.py --filename 'draft_training_data.json' --local-path './my_checkpoints'")
+    print("   python download_draft_data.py --filename 'draft_training_data.json' --local-path './my_checkpoints' --no-npz  # JSON only")
+    print("   python download_draft_data.py --local-path './my_checkpoints'  # Downloads all files")
+    print()
+    print("   Or use Modal CLI directly:")
+    print("   modal volume get coconut-checkpoints /checkpoints/draft_data/draft_training_data.json ./downloaded_checkpoints/draft_data/")
+    print("   modal volume get coconut-checkpoints /checkpoints/draft_data ./downloaded_checkpoints/draft_data/  # Entire directory")
     print()
     print("💡 Tips:")
     print("   - Use 'list_available_checkpoints' first to see what's available")
