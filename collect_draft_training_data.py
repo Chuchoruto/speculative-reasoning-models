@@ -7,6 +7,7 @@ import json
 import os
 import argparse
 import yaml
+import numpy as np
 from coconut import Coconut
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataset import get_dataset, get_cot_latent_dataset
@@ -22,13 +23,18 @@ def collect_data_distributed(model, tokenizer, dataloader, output_path, rank, wo
     """
     Collect latent thought vectors and logits from the Coconut model in distributed mode.
     
-    Each rank processes its subset of data and saves to a separate file.
-    Rank 0 combines all files at the end.
+    Each rank processes its subset of data and saves vectors to NPZ files and metadata to JSON.
+    Rank 0 combines all metadata files at the end.
     """
     model.eval()
     collected_data = []
     
     device = next(model.parameters()).device
+    
+    # Determine output directory for NPZ files
+    output_dir = os.path.dirname(output_path)
+    base_name = os.path.basename(output_path).replace('.json', '')
+    os.makedirs(output_dir, exist_ok=True)
     
     # Progress bar only on rank 0
     # DistributedSampler already splits the dataset, so each rank sees a subset
@@ -105,16 +111,30 @@ def collect_data_distributed(model, tokenizer, dataloader, output_path, rank, wo
                 token_logits = []
                 target_tokens = []
             
-            # Store collected data
+            # Calculate global sample index for consistent naming
+            sample_idx = batch_idx * world_size + rank
+            
+            # Save vectors to NPZ file (compressed numpy format)
+            npz_filename = f"{base_name}_sample_{sample_idx:06d}.npz"
+            npz_path = os.path.join(output_dir, npz_filename)
+            
+            # Convert lists to numpy arrays and save
+            np.savez_compressed(
+                npz_path,
+                latent_thoughts=np.array(latent_thoughts, dtype=np.float32),  # Shape: [num_latent_tokens, hidden_size]
+                token_logits=np.array(token_logits, dtype=np.float32),        # Shape: [num_target_tokens, vocab_size]
+            )
+            
+            # Store metadata in JSON (without the large vectors)
             sample_data = {
+                "sample_idx": sample_idx,
                 "input_ids": input_ids[0].cpu().tolist(),
                 "latent_positions": latent_positions,
-                "latent_thoughts": latent_thoughts,
                 "target_positions": target_positions if labels is not None else [],
-                "token_logits": token_logits,
                 "target_tokens": target_tokens,
                 "num_latent_tokens": len(latent_thoughts),
                 "num_target_tokens": len(target_tokens),
+                "npz_file": npz_filename,  # Reference to NPZ file
             }
             
             collected_data.append(sample_data)
@@ -140,9 +160,9 @@ def collect_data_distributed(model, tokenizer, dataloader, output_path, rank, wo
     # Wait for all ranks to finish writing
     dist.barrier()
     
-    # Rank 0 combines all files
+    # Rank 0 combines all metadata files (NPZ files are already in the output directory)
     if rank == 0:
-        print("Combining data from all ranks...")
+        print("Combining metadata from all ranks...")
         all_data = collected_data.copy()
         
         for other_rank in range(1, world_size):
@@ -151,16 +171,19 @@ def collect_data_distributed(model, tokenizer, dataloader, output_path, rank, wo
                 with open(other_rank_path, 'r') as f:
                     other_data = json.load(f)
                     all_data.extend(other_data)
-                # Optionally remove the rank-specific file
-                # os.remove(other_rank_path)
         
-        # Save combined data
+        # Sort by sample_idx to ensure consistent ordering
+        all_data.sort(key=lambda x: x['sample_idx'])
+        
+        # Save combined metadata (NPZ files are already in the output directory)
         with open(output_path, 'w') as f:
             json.dump(all_data, f, indent=2)
         
-        print(f"✅ Total collected: {len(all_data)} samples. Combined file saved to {output_path}")
+        print(f"✅ Total collected: {len(all_data)} samples.")
+        print(f"   Metadata saved to: {output_path}")
+        print(f"   Vector data stored in {len(all_data)} NPZ files in {output_dir}")
         
-        # Clean up rank-specific files
+        # Clean up rank-specific metadata files
         for other_rank in range(world_size):
             rank_path = output_path.replace('.json', f'_rank{other_rank}.json')
             if os.path.exists(rank_path):

@@ -20,7 +20,7 @@ image = (
         ])
         .env({
             "NCCL_DEBUG": "INFO",
-            "CUDA_VISIBLE_DEVICES": "0,1,2,3"
+            "CUDA_VISIBLE_DEVICES": "0"
         })
         .add_local_file("run.py", "/workspace/run.py")
         .add_local_file("coconut.py", "/workspace/coconut.py")
@@ -36,7 +36,7 @@ checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_miss
 
 @app.function(
     image=image,
-    gpu="A100:4",
+    gpu="A100:1",
     timeout=60 * 60 * 3,  # 3 hour timeout for data collection
     volumes={"/checkpoints": checkpoint_volume},  # Mount same volume
     secrets=[modal.Secret.from_name("wandb")],
@@ -52,11 +52,14 @@ def collect_draft_training_data(
 ):
     """
     Collect latent thought vectors and logits from Coconut model for draft model training.
-    Uses torchrun for distributed parallel data collection across 4 GPUs.
+    Uses torchrun for data collection with 1 GPU.
+    
+    Large vectors (latent thoughts and logits) are stored in compressed NPZ files,
+    while metadata is stored in JSON with references to the NPZ files.
     
     Args:
         checkpoint_path: Path to Coconut model checkpoint
-        output_filename: Name of the output JSON file
+        output_filename: Name of the output JSON file (NPZ files will be in same directory)
         max_samples: Maximum number of samples to collect (None for all)
         data_path: Path to dataset JSON file
         max_latent_stage: Maximum latent stage to use
@@ -90,12 +93,12 @@ def collect_draft_training_data(
     with open("draft_collection_config.yaml", "w") as f:
         yaml.dump(config, f)
     
-    print("Starting distributed data collection with 4x A100 GPUs...")
+    print("Starting data collection with 1x A100 GPU...")
     
     subprocess.run([
         "torchrun",
         "--nnodes", "1",
-        "--nproc_per_node", "4",
+        "--nproc_per_node", "1",
         "collect_draft_training_data.py",
         "draft_collection_config.yaml"
     ], check=True)
