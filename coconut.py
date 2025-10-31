@@ -8,6 +8,7 @@ from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+OutputsWithThoughts = namedtuple("OutputsWithThoughts", ["loss", "inputs_embeds", "logits", "latent_thoughts"])
 MAX_N_LATENT = 8
 
 
@@ -36,9 +37,10 @@ class Coconut(nn.Module):
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
 
-    def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
+    def forward(self, input_ids, attention_mask, labels, position_ids, collect_latent_thoughts=False, **kwargs):
 
         logits = []
+        latent_thoughts_collected = [] if collect_latent_thoughts else None
 
         latent_indices = (
             input_ids == self.latent_token_id
@@ -144,10 +146,17 @@ class Coconut(nn.Module):
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
 
-                # replace it with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
+                # Get the hidden state that will replace the latent token
+                thought_vector = hidden_states[
                     batch_idx, token_idx - 1 - hidden_states_offset, :
                 ]
+                
+                # Collect latent thought if requested
+                if collect_latent_thoughts:
+                    latent_thoughts_collected.append(thought_vector.clone().cpu())
+                
+                # replace it with the preceding last hidden states
+                tensor_list[batch_idx][token_idx] = thought_vector
 
             # assemble the new inputs_embeds
             inputs_embeds = torch.stack(
@@ -190,7 +199,10 @@ class Coconut(nn.Module):
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
 
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
+        if collect_latent_thoughts:
+            return OutputsWithThoughts(loss=loss, inputs_embeds=inputs_embeds, logits=logits, latent_thoughts=latent_thoughts_collected)
+        else:
+            return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
     def train(self):
         self.base_causallm.train()
