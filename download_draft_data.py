@@ -9,6 +9,8 @@ import json
 import glob
 import argparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 
 def run_modal_cli(command):
@@ -161,11 +163,31 @@ def download_file_from_volume_with_paths(volume_name, remote_path, local_path, v
     return False, None
 
 
+def download_single_npz_file(args_tuple):
+    """
+    Helper function to download a single NPZ file.
+    Designed to be used with ThreadPoolExecutor.
+    
+    Args:
+        args_tuple: Tuple of (volume_name, remote_path, local_path, file_paths, working_download_path_base, volume_path)
+    
+    Returns:
+        (success: bool, filename: str)
+    """
+    volume_name, remote_npz, local_npz, file_paths, working_download_path_base, volume_path = args_tuple
+    filename = os.path.basename(local_npz)
+    
+    # Download using the determined path (function will try variants if needed)
+    success, _ = download_file_from_volume_with_paths(volume_name, remote_npz, local_npz)
+    return success, filename
+
+
 def download_draft_training_data(
     filename: str = None,
     local_path: str = "./downloaded_checkpoints",
     include_npz: bool = True,
-    volume_name: str = "coconut-checkpoints"
+    volume_name: str = "coconut-checkpoints",
+    max_workers: int = 10
 ):
     """
     Download draft training data from Modal volume using CLI.
@@ -175,6 +197,7 @@ def download_draft_training_data(
         local_path: Local directory to download to
         include_npz: If True and filename is specified, also download all associated NPZ files
         volume_name: Name of the Modal volume
+        max_workers: Number of parallel download workers (default: 10)
     """
     volume_path = "/checkpoints/draft_data"
     local_draft_path = os.path.join(local_path, "draft_data")
@@ -269,9 +292,10 @@ def download_draft_training_data(
                         
                         if npz_files_to_download:
                             print(f"   Found {len(npz_files_to_download)} NPZ files to download")
-                            print("   Downloading NPZ files (this may take a while)...")
+                            print(f"   Downloading NPZ files in parallel (workers: {max_workers})...")
                             
-                            downloaded = 0
+                            # Prepare download arguments for each file
+                            download_args = []
                             for npz_filename in npz_files_to_download:
                                 local_npz = os.path.join(local_draft_path, npz_filename)
                                 
@@ -287,17 +311,47 @@ def download_draft_training_data(
                                 else:
                                     remote_npz = f"{volume_path}/{npz_filename}"
                                 
-                                # Download using the determined path (function will try variants if needed)
-                                success, _ = download_file_from_volume_with_paths(volume_name, remote_npz, local_npz)
+                                download_args.append((
+                                    volume_name,
+                                    remote_npz,
+                                    local_npz,
+                                    file_paths,
+                                    working_download_path_base,
+                                    volume_path
+                                ))
+                            
+                            # Download files in parallel
+                            downloaded = 0
+                            failed = []
+                            lock = Lock()
+                            
+                            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                                # Submit all download tasks
+                                future_to_filename = {
+                                    executor.submit(download_single_npz_file, args): os.path.basename(args[2])
+                                    for args in download_args
+                                }
                                 
-                                if success:
-                                    downloaded += 1
-                                    if downloaded % 100 == 0:
-                                        print(f"   Progress: {downloaded}/{len(npz_files_to_download)} NPZ files...")
-                                else:
-                                    print(f"   ⚠️  Failed to download: {npz_filename}")
+                                # Process completed downloads
+                                for future in as_completed(future_to_filename):
+                                    filename = future_to_filename[future]
+                                    try:
+                                        success, _ = future.result()
+                                        with lock:
+                                            if success:
+                                                downloaded += 1
+                                                if downloaded % 50 == 0:
+                                                    print(f"   Progress: {downloaded}/{len(npz_files_to_download)} NPZ files...")
+                                            else:
+                                                failed.append(filename)
+                                    except Exception as e:
+                                        with lock:
+                                            failed.append(filename)
+                                            print(f"   ⚠️  Error downloading {filename}: {e}")
                             
                             print(f"✅ Downloaded {downloaded}/{len(npz_files_to_download)} NPZ files")
+                            if failed:
+                                print(f"⚠️  Failed to download {len(failed)} files (first 10): {', '.join(failed[:10])}")
                         else:
                             print("⚠️  No NPZ files found in metadata")
                 except Exception as e:
@@ -355,9 +409,10 @@ def download_draft_training_data(
             return False
         else:
             print(f"   Found {len(files)} files")
-            print("   Downloading files...")
+            print(f"   Downloading files in parallel (workers: {max_workers})...")
             
-            downloaded = 0
+            # Prepare download arguments for each file
+            download_args = []
             for f in files:
                 local_file = os.path.join(local_draft_path, f)
                 
@@ -370,15 +425,47 @@ def download_draft_training_data(
                 else:
                     remote_file = f"{volume_path}/{f}"
                 
-                # Download using the determined path (function will try variants if needed)
-                success, _ = download_file_from_volume_with_paths(volume_name, remote_file, local_file)
+                download_args.append((
+                    volume_name,
+                    remote_file,
+                    local_file,
+                    file_paths_all,
+                    working_download_path_base,
+                    volume_path
+                ))
+            
+            # Download files in parallel
+            downloaded = 0
+            failed = []
+            lock = Lock()
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all download tasks
+                future_to_filename = {
+                    executor.submit(download_single_npz_file, args): os.path.basename(args[2])
+                    for args in download_args
+                }
                 
-                if success:
-                    downloaded += 1
-                    if downloaded % 50 == 0:
-                        print(f"   Progress: {downloaded}/{len(files)} files...")
+                # Process completed downloads
+                for future in as_completed(future_to_filename):
+                    filename = future_to_filename[future]
+                    try:
+                        success, _ = future.result()
+                        with lock:
+                            if success:
+                                downloaded += 1
+                                if downloaded % 50 == 0:
+                                    print(f"   Progress: {downloaded}/{len(files)} files...")
+                            else:
+                                failed.append(filename)
+                    except Exception as e:
+                        with lock:
+                            failed.append(filename)
+                            print(f"   ⚠️  Error downloading {filename}: {e}")
             
             print(f"\n✅ Downloaded {downloaded}/{len(files)} files to {local_draft_path}")
+            if failed:
+                print(f"⚠️  Failed to download {len(failed)} files (first 10): {', '.join(failed[:10])}")
             return True
 
 
@@ -416,6 +503,12 @@ def main():
         default="coconut-checkpoints",
         help="Name of the Modal volume (default: coconut-checkpoints)"
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=10,
+        help="Number of parallel download workers (default: 10)"
+    )
     
     args = parser.parse_args()
     
@@ -436,7 +529,8 @@ def main():
         filename=args.filename,
         local_path=args.local_path,
         include_npz=args.include_npz,
-        volume_name=args.volume_name
+        volume_name=args.volume_name,
+        max_workers=args.max_workers
     )
     
     return 0 if success else 1
