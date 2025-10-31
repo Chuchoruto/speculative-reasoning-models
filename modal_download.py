@@ -251,6 +251,94 @@ def download_latest_checkpoint(model_type: str, local_path: str = "./downloaded_
         print(f"❌ Error downloading latest {model_type} checkpoint: {e}")
         return False
 
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=60 * 60 * 2
+)
+def download_draft_training_data(filename: str = None, local_path: str = "./downloaded_checkpoints"):
+    """Download draft training data from the volume"""
+    import os
+    
+    draft_data_path = "/checkpoints/draft_data"
+    local_draft_path = f"{local_path}/draft_data"
+    os.makedirs(local_draft_path, exist_ok=True)
+    
+    try:
+        if not os.path.exists(draft_data_path):
+            print("❌ Draft data directory not found in volume")
+            return False
+        
+        files = os.listdir(draft_data_path)
+        if not files:
+            print("❌ No draft training data files found")
+            return False
+        
+        # Download specific file or all files
+        if filename:
+            if filename not in files:
+                print(f"❌ File '{filename}' not found in draft data directory")
+                print(f"Available files: {', '.join(files)}")
+                return False
+            
+            checkpoint_volume.download(
+                f"{draft_data_path}/{filename}",
+                f"{local_draft_path}/{filename}"
+            )
+            print(f"✅ Successfully downloaded '{filename}' to {local_draft_path}/{filename}")
+            return True
+        else:
+            # Download all files
+            downloaded_count = 0
+            for f in files:
+                checkpoint_volume.download(
+                    f"{draft_data_path}/{f}",
+                    f"{local_draft_path}/{f}"
+                )
+                downloaded_count += 1
+                print(f"✅ Downloaded '{f}'")
+            
+            print(f"✅ Successfully downloaded {downloaded_count} file(s) to {local_draft_path}")
+            return True
+            
+    except Exception as e:
+        print(f"❌ Error downloading draft training data: {e}")
+        return False
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=60 * 60 * 1
+)
+def list_draft_training_data():
+    """List all available draft training data files in the volume"""
+    import os
+    
+    print("🔍 Available draft training data files:")
+    print("=" * 50)
+    
+    try:
+        draft_data_path = "/checkpoints/draft_data"
+        if os.path.exists(draft_data_path):
+            files = os.listdir(draft_data_path)
+            if files:
+                print("📁 Draft Training Data:")
+                for f in sorted(files):
+                    # Try to get file size
+                    file_path = os.path.join(draft_data_path, f)
+                    try:
+                        size = os.path.getsize(file_path)
+                        size_mb = size / (1024 * 1024)
+                        print(f"   - {f} ({size_mb:.2f} MB)")
+                    except:
+                        print(f"   - {f}")
+            else:
+                print("📁 Draft Training Data: None found")
+        else:
+            print("📁 Draft Training Data: Directory not found")
+    except Exception as e:
+        print(f"❌ Error listing draft training data: {e}")
+
 @app.local_entrypoint()
 def main():
     print("🚀 Coconut Model Download Utility")
@@ -274,7 +362,13 @@ def main():
     print("   modal run modal_download.py::download_all_coconut_checkpoints --local-path './my_checkpoints'")
     print("   modal run modal_download.py::download_all_checkpoints --local-path './my_checkpoints'")
     print()
+    print("📊 Draft Training Data:")
+    print("   modal run modal_download.py::list_draft_training_data")
+    print("   modal run modal_download.py::download_draft_training_data --filename 'draft_training_data.json' --local-path './my_checkpoints'")
+    print("   modal run modal_download.py::download_draft_training_data --local-path './my_checkpoints'  # Downloads all files")
+    print()
     print("💡 Tips:")
     print("   - Use 'list_available_checkpoints' first to see what's available")
     print("   - Default local path is './downloaded_checkpoints'")
     print("   - Checkpoint names are typically 'checkpoint_1', 'checkpoint_2', etc.")
+    print("   - Draft training data is saved in '/checkpoints/draft_data/' in the volume")
