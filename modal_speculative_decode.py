@@ -52,6 +52,7 @@ def evaluate_speculative_decoding(
     max_new_tokens: int = 50,
     similarity_threshold: float = 0.9,
     max_samples: int = 100,
+    clock_run: str = "False",
 ):
     """
     Evaluate speculative decoding with draft and target models.
@@ -65,11 +66,15 @@ def evaluate_speculative_decoding(
         max_new_tokens: Maximum new tokens to generate (default 50)
         similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
         max_samples: Maximum number of samples to evaluate (default 100)
+        clock_run: Enable wallclock timing. Accepts "True", "true", "1", "False", "false", "0" (default "False")
     """
     import json
     import sys
     import numpy as np
     from tqdm import tqdm
+    
+    # Parse clock_run string to boolean
+    clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
     
     os.chdir("/workspace")
     sys.path.insert(0, "/workspace")
@@ -148,7 +153,7 @@ def evaluate_speculative_decoding(
     print(f"Loaded {len(dataset)} samples")
     
     # Import speculative decoding
-    from speculative_decode import speculative_decode
+    from speculative_decode import speculative_decode, baseline_autoregressive_decode
     
     # Evaluation metrics
     total_latent_accepted = 0
@@ -159,6 +164,12 @@ def evaluate_speculative_decoding(
     total_tokens_total = 0
     total_generated_tokens = 0
     num_samples = 0
+    
+    # Timing metrics (only used if clock_run=True)
+    total_speculative_time = 0.0
+    total_baseline_time = 0.0
+    per_sample_speculative_times = []
+    per_sample_baseline_times = []
     
     # Evaluate each sample
     print("\nStarting speculative decoding evaluation...")
@@ -218,7 +229,30 @@ def evaluate_speculative_decoding(
             total_tokens_accepted += stats.get('tokens_accepted', 0)
             total_tokens_total += stats.get('tokens_total', 0)
             total_generated_tokens += len(generated_tokens)
+            
+            # Track timing
+            if clock_run_bool:
+                speculative_time = stats.get('wallclock_time', 0.0)
+                total_speculative_time += speculative_time
+                per_sample_speculative_times.append(speculative_time)
+            
             num_samples += 1
+            
+            # If clock_run, also run baseline autoregressive decoding for comparison
+            if clock_run_bool:
+                baseline_tokens, baseline_time = baseline_autoregressive_decode(
+                    target_model,
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    latent_positions,
+                    num_latent_thoughts=num_latent_thoughts,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_token_id,
+                    device=device,
+                )
+                total_baseline_time += baseline_time
+                per_sample_baseline_times.append(baseline_time)
             
         except Exception as e:
             print(f"Error processing sample {idx}: {e}")
@@ -252,17 +286,44 @@ def evaluate_speculative_decoding(
     print(f"  Target model calls: {total_target_calls}")
     print(f"  Total calls: {total_draft_calls + total_target_calls}")
     
-    # Baseline: target-only would need one call per generated token
+    # Estimated speedup based on model calls
     baseline_target_calls = total_generated_tokens
     print(f"  Baseline (target-only) calls: {baseline_target_calls}")
     
     if baseline_target_calls > 0:
-        # Speedup = baseline_target_calls / total_target_calls
+        # Estimated speedup = baseline_target_calls / total_target_calls
         # (with parallel verification, we should have far fewer target calls)
-        speedup = baseline_target_calls / total_target_calls
-        print(f"  Estimated speedup: {speedup:.2f}x")
+        estimated_speedup = baseline_target_calls / total_target_calls
+        print(f"  Estimated speedup (based on calls): {estimated_speedup:.2f}x")
     else:
-        speedup = 0.0
+        estimated_speedup = 0.0
+    
+    # Actual wallclock speedup (if clock_run enabled)
+    if clock_run_bool and num_samples > 0:
+        print(f"\nWallclock Time Comparison:")
+        avg_speculative_time = total_speculative_time / num_samples
+        avg_baseline_time = total_baseline_time / num_samples
+        print(f"  Average speculative decoding time: {avg_speculative_time:.4f}s per sample")
+        print(f"  Average baseline decoding time: {avg_baseline_time:.4f}s per sample")
+        print(f"  Total speculative time: {total_speculative_time:.4f}s")
+        print(f"  Total baseline time: {total_baseline_time:.4f}s")
+        
+        if avg_baseline_time > 0:
+            actual_speedup = avg_baseline_time / avg_speculative_time
+            print(f"  Actual speedup (wallclock): {actual_speedup:.2f}x")
+            
+            # Calculate min/max speedup per sample
+            speedups_per_sample = [
+                baseline / spec if spec > 0 else 0.0
+                for baseline, spec in zip(per_sample_baseline_times, per_sample_speculative_times)
+            ]
+            if speedups_per_sample:
+                print(f"  Min speedup: {min(speedups_per_sample):.2f}x")
+                print(f"  Max speedup: {max(speedups_per_sample):.2f}x")
+        else:
+            actual_speedup = 0.0
+    else:
+        actual_speedup = 0.0
     
     print(f"\nGeneration:")
     print(f"  Total tokens generated: {total_generated_tokens}")
@@ -285,10 +346,25 @@ def evaluate_speculative_decoding(
         "target_calls": total_target_calls,
         "total_calls": total_draft_calls + total_target_calls,
         "baseline_calls": baseline_target_calls,
-        "estimated_speedup": speedup,
+        "estimated_speedup": estimated_speedup,
         "total_tokens": total_generated_tokens,
         "avg_tokens_per_sample": total_generated_tokens / num_samples if num_samples > 0 else 0.0,
     }
+    
+    # Add timing results if clock_run enabled
+    if clock_run_bool:
+        results.update({
+            "clock_run": True,
+            "total_speculative_time": total_speculative_time,
+            "total_baseline_time": total_baseline_time,
+            "avg_speculative_time": total_speculative_time / num_samples if num_samples > 0 else 0.0,
+            "avg_baseline_time": total_baseline_time / num_samples if num_samples > 0 else 0.0,
+            "actual_speedup": actual_speedup,
+            "per_sample_speculative_times": per_sample_speculative_times,
+            "per_sample_baseline_times": per_sample_baseline_times,
+        })
+    else:
+        results["clock_run"] = False
     
     results_path = "/checkpoints/speculative_decoding_results.json"
     with open(results_path, "w") as f:
@@ -312,7 +388,8 @@ def main():
     print("    --gamma 4 \\")
     print("    --max-new-tokens 50 \\")
     print("    --similarity-threshold 0.9 \\")
-    print("    --max-samples 100")
+    print("    --max-samples 100 \\")
+    print("    --clock-run True")
     print()
     print("Required Parameters:")
     print("  - draft-checkpoint-path: Path to draft model checkpoint in Modal volume")
@@ -327,6 +404,9 @@ def main():
     print("  - similarity-threshold: Cosine similarity threshold for latent thought acceptance (default: 0.9)")
     print("                            ⚠️  Range: 0.0-1.0. Higher = stricter acceptance criteria")
     print("  - max-samples: Maximum number of samples to evaluate (default: 100)")
+    print("  - clock-run: Enable wallclock time comparison with baseline autoregressive decoding (default: \"False\")")
+    print("              ⚠️  Accepts: \"True\", \"true\", \"1\", \"False\", \"false\", \"0\"")
+    print("              When enabled, also runs baseline decoding and reports actual speedup based on time")
     print()
     print("Examples:")
     print("  # Use higher gamma for better parallelization:")
@@ -335,10 +415,17 @@ def main():
     print("  # Use stricter latent thought acceptance:")
     print("  --gamma 4 --similarity-threshold 0.95")
     print()
+    print("  # Get actual wallclock speedup comparison:")
+    print("  --gamma 4 --similarity-threshold 0.9 --clock-run True")
+    print("  # Or:")
+    print("  --gamma 4 --similarity-threshold 0.9 --clock-run \"True\"")
+    print()
     print("The script will evaluate speculative decoding and report:")
     print("  - Latent thought acceptance rate")
     print("  - Token acceptance rate")
     print("  - Model call counts (draft vs target)")
-    print("  - Estimated speedup vs baseline")
+    print("  - Estimated speedup vs baseline (based on model calls)")
+    if True:  # Always show this option
+        print("  - Actual wallclock speedup (if --clock-run True)")
     print("  - Generation statistics")
 

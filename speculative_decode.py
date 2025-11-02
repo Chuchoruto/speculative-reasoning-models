@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
 import numpy as np
+import time
 
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -432,6 +433,9 @@ def speculative_decode(
         'num_target_calls': 0,
     }
     
+    # Track wallclock time for speculative decoding
+    start_time = time.perf_counter()
+    
     # Step 1: Generate and verify latent thoughts
     acceptance_list, draft_thoughts, target_thoughts = speculative_decode_latent_thoughts(
         draft_model,
@@ -493,5 +497,141 @@ def speculative_decode(
     stats['tokens_accepted'] = tokens_accepted
     stats['tokens_total'] = tokens_total
     
+    # Record wallclock time
+    end_time = time.perf_counter()
+    stats['wallclock_time'] = end_time - start_time
+    
     return generated_tokens, stats
+
+
+def baseline_autoregressive_decode(
+    target_model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    latent_positions: List[int],
+    num_latent_thoughts: int = 6,
+    max_new_tokens: int = 50,
+    eos_token_id: int = None,
+    device: torch.device = None,
+) -> Tuple[List[int], float]:
+    """
+    Baseline autoregressive generation using only the target model.
+    Processes latent thoughts and then generates tokens autoregressively.
+    
+    Args:
+        target_model: Target (Coconut) model instance
+        input_ids: Input sequence [seq_len]
+        attention_mask: Attention mask [seq_len]
+        position_ids: Position IDs [seq_len]
+        latent_positions: Positions of latent tokens
+        num_latent_thoughts: Number of latent thoughts (default 6)
+        max_new_tokens: Maximum new tokens to generate
+        eos_token_id: EOS token ID
+        device: Device to run on
+    
+    Returns:
+        (generated_tokens, wallclock_time)
+    """
+    if device is None:
+        device = input_ids.device
+    
+    target_model.eval()
+    
+    # Track wallclock time
+    start_time = time.perf_counter()
+    
+    # Expand to batch dimension
+    input_ids_batch = input_ids.unsqueeze(0).to(device)
+    attention_mask_batch = attention_mask.unsqueeze(0).to(device)
+    position_ids_batch = position_ids.unsqueeze(0).to(device)
+    
+    # Process latent thoughts first (similar to Coconut forward pass)
+    # Create dummy labels for forward pass
+    dummy_labels = torch.full(
+        (input_ids_batch.shape[0], input_ids_batch.shape[1]),
+        -100,
+        dtype=torch.long,
+        device=device
+    )
+    
+    # Forward pass through Coconut model to process latent tokens
+    with torch.no_grad():
+        outputs = target_model(
+            input_ids=input_ids_batch,
+            attention_mask=attention_mask_batch,
+            position_ids=position_ids_batch,
+            labels=dummy_labels,
+            collect_latent_thoughts=False,
+        )
+    
+    # Get the position after latent tokens
+    if len(latent_positions) > 0:
+        last_latent_pos = max(latent_positions)
+        start_pos = last_latent_pos + 1
+    else:
+        start_pos = len(input_ids)
+    
+    # Create sequence from start of input to position after latent tokens
+    if start_pos < len(input_ids):
+        current_input_ids = input_ids[:start_pos].clone().to(device)
+        current_attention_mask = attention_mask[:start_pos].clone().to(device)
+        current_position_ids = position_ids[:start_pos].clone().to(device)
+    else:
+        current_input_ids = input_ids.clone().to(device)
+        current_attention_mask = attention_mask.clone().to(device)
+        current_position_ids = position_ids.clone().to(device)
+    
+    # Expand to batch dimension for generation
+    current_input_ids = current_input_ids.unsqueeze(0)
+    current_attention_mask = current_attention_mask.unsqueeze(0)
+    current_position_ids = current_position_ids.unsqueeze(0)
+    
+    generated_tokens = []
+    
+    # Autoregressive generation
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            dummy_labels_gen = torch.full(
+                (current_input_ids.shape[0], current_input_ids.shape[1]),
+                -100,
+                dtype=torch.long,
+                device=device
+            )
+            outputs = target_model(
+                input_ids=current_input_ids,
+                attention_mask=current_attention_mask,
+                position_ids=current_position_ids,
+                labels=dummy_labels_gen,
+                collect_latent_thoughts=False,
+            )
+            
+            # Get next token (greedy decoding)
+            next_token_logits = outputs.logits[0, -1, :]
+            next_token = torch.argmax(next_token_logits).item()
+            generated_tokens.append(next_token)
+            
+            # Check for EOS
+            if eos_token_id is not None and next_token == eos_token_id:
+                break
+            
+            # Append to input for next iteration
+            current_input_ids = torch.cat([
+                current_input_ids,
+                torch.tensor([[next_token]], device=device)
+            ], dim=1)
+            current_attention_mask = torch.cat([
+                current_attention_mask,
+                torch.ones((1, 1), device=device, dtype=torch.long)
+            ], dim=1)
+            current_position_ids = torch.cat([
+                current_position_ids,
+                torch.tensor([[current_position_ids[0, -1].item() + 1]], device=device)
+            ], dim=1)
+    
+    # Record wallclock time
+    end_time = time.perf_counter()
+    wallclock_time = end_time - start_time
+    
+    return generated_tokens, wallclock_time
 
