@@ -46,6 +46,7 @@ def train_draft_model(
     batch_size: int = 32,
     num_epochs: int = 10,
     lr: float = 1e-4,
+    weight_decay: float = 0.01,
     kl_weight: float = 1.0,
     mse_weight: float = 1.0,
     temperature: float = 1.0,
@@ -60,6 +61,7 @@ def train_draft_model(
         batch_size: Training batch size per GPU (effective batch size = batch_size * 2)
         num_epochs: Number of training epochs
         lr: Learning rate
+        weight_decay: Weight decay for optimizer (L2 regularization)
         kl_weight: Weight for KL divergence loss
         mse_weight: Weight for MSE loss
         temperature: Temperature for softmax in KL divergence
@@ -104,7 +106,7 @@ def train_draft_model(
         "batch_size": batch_size,
         "num_epochs": num_epochs,
         "lr": lr,
-        "weight_decay": 0.01,
+        "weight_decay": weight_decay,
         "num_workers": 4,
         "kl_weight": kl_weight,
         "mse_weight": mse_weight,
@@ -148,6 +150,7 @@ def main():
     print("    --batch-size 32 \\")
     print("    --num-epochs 10 \\")
     print("    --lr 1e-4 \\")
+    print("    --weight-decay 0.01 \\")
     print("    --kl-weight 1.0 \\")
     print("    --mse-weight 1.0 \\")
     print("    --wandb-project 'draft-model-training' \\")
@@ -158,6 +161,7 @@ def main():
     print("  - batch_size: 32 (per GPU, effective: 64 with 2 GPUs)")
     print("  - num_epochs: 10")
     print("  - lr: 1e-4")
+    print("  - weight_decay: 0.01")
     print("  - kl_weight: 1.0")
     print("  - mse_weight: 1.0")
     print("  - temperature: 1.0")
