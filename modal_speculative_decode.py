@@ -53,6 +53,7 @@ def evaluate_speculative_decoding(
     similarity_threshold: float = 0.9,
     max_samples: int = 100,
     clock_run: str = "False",
+    record_output: str = "False",
 ):
     """
     Evaluate speculative decoding with draft and target models.
@@ -67,14 +68,21 @@ def evaluate_speculative_decoding(
         similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
         max_samples: Maximum number of samples to evaluate (default 100)
         clock_run: Enable wallclock timing. Accepts "True", "true", "1", "False", "false", "0" (default "False")
+        record_output: Record generated outputs for comparison. Requires clock_run=True. Accepts "True", "true", "1", etc. (default "False")
     """
     import json
     import sys
     import numpy as np
+    import os
     from tqdm import tqdm
     
-    # Parse clock_run string to boolean
+    # Parse string parameters to boolean
     clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
+    record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
+    
+    if record_output_bool and not clock_run_bool:
+        print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
+        record_output_bool = False
     
     os.chdir("/workspace")
     sys.path.insert(0, "/workspace")
@@ -171,6 +179,12 @@ def evaluate_speculative_decoding(
     per_sample_speculative_times = []
     per_sample_baseline_times = []
     
+    # Output recording (only used if record_output=True and clock_run=True)
+    output_records = []
+    if record_output_bool:
+        # Load original data to get question text
+        original_data = json.load(open(data_path))[:max_samples]
+    
     # Evaluate each sample
     print("\nStarting speculative decoding evaluation...")
     rng = np.random.default_rng(42)  # Fixed seed for reproducibility
@@ -253,6 +267,29 @@ def evaluate_speculative_decoding(
                 )
                 total_baseline_time += baseline_time
                 per_sample_baseline_times.append(baseline_time)
+                
+                # Record outputs if requested
+                if record_output_bool:
+                    # Decode tokens to text
+                    spec_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                    baseline_text = tokenizer.decode(baseline_tokens, skip_special_tokens=True)
+                    
+                    # Get original question text from dataset
+                    original_idx = sample.get("idx", idx)
+                    if original_idx < len(original_data):
+                        question_text = original_data[original_idx].get("question", "N/A")
+                    else:
+                        question_text = f"Sample {idx}"
+                    
+                    output_records.append({
+                        "sample_idx": idx,
+                        "question": question_text,
+                        "output_spec_decode": spec_text,
+                        "output_standard_decode": baseline_text,
+                        "tokens_spec_decode": generated_tokens,
+                        "tokens_standard_decode": baseline_tokens,
+                        "exact_match": generated_tokens == baseline_tokens,
+                    })
             
         except Exception as e:
             print(f"Error processing sample {idx}: {e}")
@@ -371,6 +408,21 @@ def evaluate_speculative_decoding(
         json.dump(results, f, indent=2)
     
     print(f"\nResults saved to: {results_path}")
+    
+    # Save output records if requested
+    if record_output_bool and output_records:
+        output_dir = "/checkpoints/output_verification"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, "output_comparison.json")
+        with open(output_path, "w") as f:
+            json.dump(output_records, f, indent=2)
+        print(f"\nOutput comparison saved to: {output_path}")
+        print(f"  Total samples recorded: {len(output_records)}")
+        
+        # Count exact matches
+        exact_matches = sum(1 for record in output_records if record["exact_match"])
+        print(f"  Exact token matches: {exact_matches}/{len(output_records)} ({exact_matches/len(output_records):.1%})")
+    
     checkpoint_volume.commit()
 
 
@@ -389,7 +441,8 @@ def main():
     print("    --max-new-tokens 50 \\")
     print("    --similarity-threshold 0.9 \\")
     print("    --max-samples 100 \\")
-    print("    --clock-run True")
+    print("    --clock-run True \\")
+    print("    --record-output True")
     print()
     print("Required Parameters:")
     print("  - draft-checkpoint-path: Path to draft model checkpoint in Modal volume")
@@ -407,6 +460,9 @@ def main():
     print("  - clock-run: Enable wallclock time comparison with baseline autoregressive decoding (default: \"False\")")
     print("              ⚠️  Accepts: \"True\", \"true\", \"1\", \"False\", \"false\", \"0\"")
     print("              When enabled, also runs baseline decoding and reports actual speedup based on time")
+    print("  - record-output: Record generated outputs for comparison (default: \"False\")")
+    print("                  ⚠️  Requires clock-run=True. Accepts: \"True\", \"true\", \"1\", etc.")
+    print("                  Saves outputs to /checkpoints/output_verification/output_comparison.json")
     print()
     print("Examples:")
     print("  # Use higher gamma for better parallelization:")
