@@ -104,7 +104,11 @@ def compute_loss(
             student_latents = student_latent_thoughts_list[batch_idx]  # List of [768] tensors
             teacher_latents = teacher_latent_thoughts_list[batch_idx]  # [num_latent, 768]
             
-            if len(student_latents) > 0 and teacher_latents is not None and len(teacher_latents) > 0:
+            # Debug: check what we have
+            student_count = len(student_latents) if student_latents else 0
+            teacher_count = len(teacher_latents) if teacher_latents is not None else 0
+            
+            if student_count > 0 and teacher_count > 0:
                 # Stack student latent thoughts
                 try:
                     student_latents_stacked = torch.stack([
@@ -123,6 +127,7 @@ def compute_loss(
                         num_mse_samples += 1
                 except Exception as e:
                     # Skip if stacking fails (e.g., empty list or shape mismatch)
+                    # This should not happen often - log if it does
                     pass
     
     # Average losses
@@ -174,12 +179,13 @@ def train_epoch(
         teacher_latent_thoughts = [thoughts.to(device) for thoughts in batch['latent_thoughts']]
         target_tokens = [tokens.to(device) for tokens in batch['target_tokens']]
         
-        # Forward pass
+        # Forward pass - use known latent positions from dataset
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             collect_latent_thoughts=True,
+            latent_positions=batch['latent_positions'],  # Pass known positions
         )
         
         # Move student latent thoughts to device (already organized by sample)
@@ -187,6 +193,13 @@ def train_epoch(
             [thought.to(device) for thought in sample_latents]
             for sample_latents in outputs.latent_thoughts
         ] if outputs.latent_thoughts else [[] for _ in range(input_ids.shape[0])]
+        
+        # Debug: Check how many samples have latent thoughts
+        if batch_idx == 0 and rank == 0:
+            num_samples_with_student_latents = sum(1 for latents in student_latent_thoughts_by_sample if len(latents) > 0)
+            num_samples_with_teacher_latents = sum(1 for latents in teacher_latent_thoughts if latents is not None and len(latents) > 0)
+            print(f"Debug batch {batch_idx}: {num_samples_with_student_latents}/{len(student_latent_thoughts_by_sample)} samples have student latents")
+            print(f"Debug batch {batch_idx}: {num_samples_with_teacher_latents}/{len(teacher_latent_thoughts)} samples have teacher latents")
         
         # Compute loss
         loss_dict = compute_loss(
@@ -333,7 +346,7 @@ def main():
         data_dir=config.get('data_dir', None),
     )
     
-    collator = DraftCollator(pad_token_id=tokenizer.pad_token_id)
+    collator = DraftCollator(pad_token_id=tokenizer.pad_token_id, latent_token_id=latent_id)
     
     # Create distributed sampler if using distributed training
     if use_distributed:

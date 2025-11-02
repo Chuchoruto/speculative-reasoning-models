@@ -85,54 +85,114 @@ class DraftCollator:
     """
     Custom collator for batching draft training data.
     Handles variable-length sequences and aligns latent thoughts with positions.
+    Uses Coconut-style left-padding to align latent token positions across batch.
     """
     
-    def __init__(self, pad_token_id=-100):
+    def __init__(self, pad_token_id=-100, latent_token_id=None):
         self.pad_token_id = pad_token_id
+        self.latent_token_id = latent_token_id
     
     def __call__(self, batch):
         """
         Collate a batch of samples.
         
+        Aligns latent token positions by left-padding (like Coconut's collator)
+        so all samples have their first latent token at the same position.
+        
         Returns batched tensors and metadata for loss computation.
         """
         batch_size = len(batch)
         
-        # Pad input_ids to same length
-        max_input_len = max(len(item['input_ids']) for item in batch)
+        # Find earliest latent position in each sample (if latent_token_id is provided)
+        earliest_latent_positions = []
+        if self.latent_token_id is not None:
+            for item in batch:
+                input_ids = item['input_ids']
+                latent_pos = item.get('latent_positions', [])
+                if len(latent_pos) > 0:
+                    earliest_latent_positions.append(min(latent_pos))
+                else:
+                    earliest_latent_positions.append(None)
+        
+        # Find the latest earliest latent position (like Coconut)
+        if earliest_latent_positions:
+            latest_earliest_latent = max([p for p in earliest_latent_positions if p is not None] or [0])
+        else:
+            latest_earliest_latent = 0
+        
+        # First pass: calculate all left paddings
+        left_paddings = []
+        for item in batch:
+            latent_positions = item.get('latent_positions', [])
+            if self.latent_token_id is not None and len(latent_positions) > 0:
+                earliest_latent = min(latent_positions)
+                left_padding = latest_earliest_latent - earliest_latent
+            else:
+                left_padding = 0
+            left_paddings.append(left_padding)
+        
+        # Calculate max total length after left padding
+        max_input_len = max(len(item['input_ids']) + left_paddings[i] for i, item in enumerate(batch))
+        
         input_ids_batch = []
         attention_mask_batch = []
+        position_ids_batch = []
+        updated_latent_positions_batch = []
         
-        for item in batch:
+        for item_idx, item in enumerate(batch):
             input_ids = item['input_ids']
-            padding_len = max_input_len - len(input_ids)
+            latent_positions = item.get('latent_positions', [])
+            left_padding = left_paddings[item_idx]
             
+            # Calculate right padding needed for max length
+            right_padding = max_input_len - len(input_ids) - left_padding
+            
+            # Add left padding (align latent positions)
             input_ids_padded = torch.cat([
+                torch.full((left_padding,), self.pad_token_id, dtype=torch.long),
                 input_ids,
-                torch.full((padding_len,), self.pad_token_id, dtype=torch.long)
+                torch.full((right_padding,), self.pad_token_id, dtype=torch.long)
             ])
+            
             attention_mask = torch.cat([
+                torch.zeros(left_padding, dtype=torch.long),
                 torch.ones(len(input_ids), dtype=torch.long),
-                torch.zeros(padding_len, dtype=torch.long)
+                torch.zeros(right_padding, dtype=torch.long)
             ])
+            
+            # Update position_ids and latent_positions to account for left padding
+            # Coconut's approach: left-padded positions get position 0, then sequence continues
+            position_ids = torch.zeros(max_input_len, dtype=torch.long)
+            if left_padding > 0:
+                # Left-padded positions stay at 0
+                # Actual sequence starts at left_padding and continues
+                position_ids[left_padding:] = torch.arange(
+                    len(input_ids) + right_padding, dtype=torch.long
+                )
+            else:
+                # No left padding, just regular positions
+                position_ids = torch.arange(max_input_len, dtype=torch.long)
+            
+            # Update latent_positions to account for left padding
+            updated_latent_positions = [pos + left_padding for pos in latent_positions]
             
             input_ids_batch.append(input_ids_padded)
             attention_mask_batch.append(attention_mask)
+            position_ids_batch.append(position_ids)
+            updated_latent_positions_batch.append(updated_latent_positions)
         
         input_ids_batch = torch.stack(input_ids_batch)
         attention_mask_batch = torch.stack(attention_mask_batch)
-        
-        # Create position_ids
-        position_ids_batch = torch.arange(
-            max_input_len, dtype=torch.long
-        ).unsqueeze(0).expand(batch_size, -1)
+        position_ids_batch = torch.stack(position_ids_batch)
         
         # Collect target data (not batched, handled per-sample in loss)
         target_tokens_list = [item['target_tokens'] for item in batch]
         target_logits_list = [item['target_logits'] for item in batch]
         latent_thoughts_list = [item['latent_thoughts'] for item in batch]
-        latent_positions_list = [item['latent_positions'] for item in batch]
+        # Use updated latent positions (accounting for left padding)
+        latent_positions_list = updated_latent_positions_batch
         target_positions_list = [item['target_positions'] for item in batch]
+        # Note: target_positions might also need adjustment, but they're relative to the output sequence
         
         return {
             'input_ids': input_ids_batch,
@@ -141,7 +201,7 @@ class DraftCollator:
             'target_tokens': target_tokens_list,  # List of tensors
             'target_logits': target_logits_list,  # List of tensors
             'latent_thoughts': latent_thoughts_list,  # List of tensors
-            'latent_positions': latent_positions_list,  # List of lists
+            'latent_positions': latent_positions_list,  # List of lists (updated for alignment)
             'target_positions': target_positions_list,  # List of lists
         }
 
