@@ -379,6 +379,32 @@ def main():
     
     # Training loop
     num_epochs = config.get('num_epochs', 10)
+    
+    # Setup learning rate schedulers
+    # Base scheduler: Exponential decay (decays every epoch by a fixed factor)
+    from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
+    
+    initial_lr = config.get('lr', 1e-4)
+    # Calculate decay factor to reach ~10% of initial LR by end of training
+    # gamma^num_epochs = 0.1 => gamma = 0.1^(1/num_epochs)
+    gamma = 0.1 ** (1.0 / num_epochs)
+    
+    # Base scheduler: exponential decay (decays every epoch)
+    scheduler = ExponentialLR(optimizer, gamma=gamma)
+    
+    # Additional scheduler: Reduce on plateau for KL loss
+    # This will provide additional LR reduction when KL loss plateaus
+    # Threshold: requires at least 3% relative improvement to count as progress
+    plateau_scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,  # Reduce LR by half when plateau detected
+        patience=2,  # Wait 2 epochs without improvement before reducing
+        verbose=True,  # Print LR reduction messages
+        min_lr=1e-6,  # Minimum learning rate
+        threshold=0.03,  # Require at least 3% relative improvement to count as progress
+        threshold_mode='rel',  # Relative threshold mode
+    )
     kl_weight = config.get('kl_weight', 1.0)
     mse_weight = config.get('mse_weight', 1.0)
     temperature = config.get('temperature', 1.0)
@@ -422,6 +448,19 @@ def main():
                 'epoch/kl_loss': metrics['avg_kl'],
                 'epoch/mse_loss': metrics['avg_mse'],
             })
+        
+        # Update learning rate schedulers
+        # Only on rank 0 to avoid multiple print statements
+        if rank == 0:
+            # Step exponential decay scheduler (decays every epoch)
+            scheduler.step()
+            
+            # Also check plateau scheduler for additional reduction when KL plateaus
+            plateau_scheduler.step(metrics['avg_kl'])
+            
+            current_lr = optimizer.param_groups[0]['lr']
+            if wandb_run is not None:
+                wandb_run.log({'train/learning_rate': current_lr})
         
         # Save checkpoint (only on rank 0)
         if config.get('save_path') and rank == 0:
