@@ -178,9 +178,9 @@ def speculative_decode_tokens(
     eos_token_id: int = None,
     device: torch.device = None,
     rng: Optional[np.random.Generator] = None,
-) -> Tuple[List[int], int, int]:
+) -> Tuple[List[int], int, int, int, int]:
     """
-    Speculative decoding for token generation.
+    Speculative decoding for token generation with parallel verification.
     
     Args:
         draft_model: Draft model instance
@@ -195,7 +195,7 @@ def speculative_decode_tokens(
         rng: Random number generator
     
     Returns:
-        (generated_tokens, num_draft_calls, num_target_calls)
+        (generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total)
     """
     if device is None:
         device = input_ids.device
@@ -213,9 +213,11 @@ def speculative_decode_tokens(
     
     num_draft_calls = 0
     num_target_calls = 0
+    tokens_accepted = 0
+    tokens_total = 0
     
-    for _ in range(max_new_tokens):
-        # Draft model generates gamma tokens
+    while len(generated_tokens) < max_new_tokens:
+        # Draft model generates gamma tokens sequentially
         draft_tokens = []
         draft_logits_list = []
         
@@ -223,6 +225,7 @@ def speculative_decode_tokens(
         draft_attn = current_attention_mask.unsqueeze(0)
         draft_pos = current_position_ids.unsqueeze(0)
         
+        # Generate all gamma draft tokens
         for _ in range(gamma):
             num_draft_calls += 1
             with torch.no_grad():
@@ -255,94 +258,102 @@ def speculative_decode_tokens(
                     torch.tensor([[draft_pos[0, -1].item() + 1]], device=device)
                 ], dim=1)
         
-        # Verify draft tokens with target model
-        verified_tokens = []
+        # PARALLEL VERIFICATION: Build full sequence with all draft tokens
+        # and call target model ONCE to get logits for all positions
         target_input = current_input_ids.unsqueeze(0)
         target_attn = current_attention_mask.unsqueeze(0)
         target_pos = current_position_ids.unsqueeze(0)
         
+        # Append all draft tokens to target input for parallel verification
+        draft_tokens_tensor = torch.tensor([draft_tokens], device=device)
+        target_input_full = torch.cat([target_input, draft_tokens_tensor], dim=1)
+        target_attn_full = torch.cat([
+            target_attn,
+            torch.ones((1, len(draft_tokens)), device=device, dtype=torch.long)
+        ], dim=1)
+        target_pos_full = torch.cat([
+            target_pos,
+            torch.arange(
+                target_pos[0, -1].item() + 1,
+                target_pos[0, -1].item() + 1 + len(draft_tokens),
+                device=device
+            ).unsqueeze(0)
+        ], dim=1)
+        
+        # Single forward pass to get logits for all draft token positions
+        num_target_calls += 1
+        with torch.no_grad():
+            dummy_labels = torch.full(
+                (target_input_full.shape[0], target_input_full.shape[1]),
+                -100,
+                dtype=torch.long,
+                device=device
+            )
+            target_outputs = target_model(
+                input_ids=target_input_full,
+                attention_mask=target_attn_full,
+                position_ids=target_pos_full,
+                labels=dummy_labels,
+                collect_latent_thoughts=False,
+            )
+            
+            # Extract logits for each draft token position
+            # Logits shape: [batch=1, seq_len, vocab_size]
+            # Note: logits[i] are the logits for predicting token at position i+1
+            # So for draft token at position base_len+i, we need logits[base_len+i-1]
+            # For draft token 0 (at base_len), we need logits[base_len-1]
+            # For draft token i (at base_len+i), we need logits[base_len+i-1]
+            base_len = target_input.shape[1]
+            # Extract logits at positions [base_len-1, base_len, ..., base_len+len(draft_tokens)-2]
+            # These correspond to predictions for draft tokens at positions [base_len, base_len+1, ..., base_len+len(draft_tokens)-1]
+            start_idx = base_len - 1
+            end_idx = base_len + len(draft_tokens) - 1
+            target_logits_all = target_outputs.logits[0, start_idx:end_idx, :]
+        
+        # Verify all tokens in parallel using the extracted logits
+        verified_tokens = []
         all_accepted = True
+        first_rejection_idx = None
         
         for i, draft_token in enumerate(draft_tokens):
-            num_target_calls += 1
-            with torch.no_grad():
-                # Get target logits
-                # Note: Coconut model requires labels parameter (can be None or dummy)
-                dummy_labels = torch.full(
-                    (target_input.shape[0], target_input.shape[1]),
-                    -100,
-                    dtype=torch.long,
-                    device=device
-                )
-                target_outputs = target_model(
-                    input_ids=target_input,
-                    attention_mask=target_attn,
-                    position_ids=target_pos,
-                    labels=dummy_labels,
-                    collect_latent_thoughts=False,
-                )
-                target_logits = target_outputs.logits[0, -1, :]
+            tokens_total += 1
+            
+            # Get probabilities for this position
+            target_logits_i = target_logits_all[i, :]  # [vocab_size]
+            target_probs_i = F.softmax(target_logits_i, dim=-1)
+            draft_probs_i = F.softmax(draft_logits_list[i], dim=-1)
+            
+            draft_prob = draft_probs_i[draft_token].item()
+            target_prob = target_probs_i[draft_token].item()
+            
+            # Speculative decoding acceptance
+            accepted, _ = accept_token_speculative(
+                draft_prob,
+                target_prob,
+                rng=rng
+            )
+            
+            if accepted:
+                verified_tokens.append(draft_token)
+                tokens_accepted += 1
+            else:
+                # Rejected: sample from adjusted distribution
+                all_accepted = False
+                first_rejection_idx = i
                 
-                # Get probabilities
-                target_probs = F.softmax(target_logits, dim=-1)
-                draft_probs = F.softmax(draft_logits_list[i], dim=-1)
+                # Adjusted distribution: norm(max(0, p(x) - q(x)))
+                adjusted_probs = torch.clamp(target_probs_i - draft_probs_i, min=0.0)
+                adjusted_sum = adjusted_probs.sum()
                 
-                draft_prob = draft_probs[draft_token].item()
-                target_prob = target_probs[draft_token].item()
-                
-                # Speculative decoding acceptance
-                accepted, _ = accept_token_speculative(
-                    draft_prob,
-                    target_prob,
-                    rng=rng
-                )
-                
-                if accepted:
-                    verified_tokens.append(draft_token)
-                    # Append to target input for next verification
-                    target_input = torch.cat([
-                        target_input,
-                        torch.tensor([[draft_token]], device=device)
-                    ], dim=1)
-                    target_attn = torch.cat([
-                        target_attn,
-                        torch.ones((1, 1), device=device, dtype=torch.long)
-                    ], dim=1)
-                    target_pos = torch.cat([
-                        target_pos,
-                        torch.tensor([[target_pos[0, -1].item() + 1]], device=device)
-                    ], dim=1)
+                if adjusted_sum > 0:
+                    adjusted_probs = adjusted_probs / adjusted_sum
+                    sampled_token = torch.multinomial(adjusted_probs, 1).item()
                 else:
-                    # Rejected: sample from adjusted distribution
-                    # Adjusted distribution: norm(max(0, p(x) - q(x)))
-                    all_accepted = False
-                    adjusted_probs = torch.clamp(target_probs - draft_probs, min=0.0)
-                    adjusted_sum = adjusted_probs.sum()
-                    
-                    if adjusted_sum > 0:
-                        adjusted_probs = adjusted_probs / adjusted_sum
-                        sampled_token = torch.multinomial(adjusted_probs, 1).item()
-                    else:
-                        # Fallback: sample from target distribution
-                        sampled_token = torch.multinomial(target_probs, 1).item()
-                    
-                    verified_tokens.append(sampled_token)
-                    
-                    # Update current state with the sampled token and break
-                    target_input = torch.cat([
-                        target_input,
-                        torch.tensor([[sampled_token]], device=device)
-                    ], dim=1)
-                    current_input_ids = target_input[0]
-                    current_attention_mask = torch.cat([
-                        target_attn,
-                        torch.ones((1, 1), device=device, dtype=torch.long)
-                    ], dim=1)[0]
-                    current_position_ids = torch.cat([
-                        target_pos,
-                        torch.tensor([[target_pos[0, -1].item() + 1]], device=device)
-                    ], dim=1)[0]
-                    break
+                    # Fallback: sample from target distribution
+                    sampled_token = torch.multinomial(target_probs_i, 1).item()
+                
+                verified_tokens.append(sampled_token)
+                break  # Stop after first rejection
         
         # Add verified tokens to output
         generated_tokens.extend(verified_tokens)
@@ -351,13 +362,25 @@ def speculative_decode_tokens(
         if eos_token_id is not None and eos_token_id in verified_tokens:
             break
         
-        # If all accepted, update current state and continue drafting
+        # Update current state for next iteration
         if all_accepted:
-            current_input_ids = target_input[0]
-            current_attention_mask = target_attn[0]
-            current_position_ids = target_pos[0]
+            # All tokens accepted: continue from end of verified sequence
+            current_input_ids = target_input_full[0]
+            current_attention_mask = target_attn_full[0]
+            current_position_ids = target_pos_full[0]
+        else:
+            # Rejection occurred: restart from the token after the rejection
+            # (the rejected token was replaced, so we continue from there)
+            verified_len = len(verified_tokens)
+            current_input_ids = target_input_full[0, :base_len + verified_len]
+            current_attention_mask = target_attn_full[0, :base_len + verified_len]
+            current_position_ids = target_pos_full[0, :base_len + verified_len]
+        
+        # Break if we've generated enough tokens
+        if len(generated_tokens) >= max_new_tokens:
+            break
     
-    return generated_tokens, num_draft_calls, num_target_calls
+    return generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total
 
 
 def speculative_decode(
@@ -452,7 +475,7 @@ def speculative_decode(
     
     # Generate tokens with speculative decoding
     # This will generate new tokens after the latent thought section
-    generated_tokens, num_draft, num_target = speculative_decode_tokens(
+    generated_tokens, num_draft, num_target, tokens_accepted, tokens_total = speculative_decode_tokens(
         draft_model,
         target_model,
         token_input_ids,
@@ -467,6 +490,8 @@ def speculative_decode(
     
     stats['num_draft_calls'] = num_draft
     stats['num_target_calls'] = num_target
+    stats['tokens_accepted'] = tokens_accepted
+    stats['tokens_total'] = tokens_total
     
     return generated_tokens, stats
 

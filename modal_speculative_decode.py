@@ -155,7 +155,8 @@ def evaluate_speculative_decoding(
     total_latent_total = 0
     total_draft_calls = 0
     total_target_calls = 0
-    total_target_only_calls = 0  # For baseline comparison
+    total_tokens_accepted = 0
+    total_tokens_total = 0
     total_generated_tokens = 0
     num_samples = 0
     
@@ -214,11 +215,10 @@ def evaluate_speculative_decoding(
             total_latent_total += stats['latent_total']
             total_draft_calls += stats['num_draft_calls']
             total_target_calls += stats['num_target_calls']
+            total_tokens_accepted += stats.get('tokens_accepted', 0)
+            total_tokens_total += stats.get('tokens_total', 0)
             total_generated_tokens += len(generated_tokens)
             num_samples += 1
-            
-            # For baseline: target-only would need one call per token
-            total_target_only_calls += len(generated_tokens)
             
         except Exception as e:
             print(f"Error processing sample {idx}: {e}")
@@ -229,20 +229,40 @@ def evaluate_speculative_decoding(
     print("SPECULATIVE DECODING EVALUATION RESULTS")
     print("=" * 60)
     print(f"Evaluated {num_samples} samples")
+    
+    # Latent thought acceptance
     print(f"\nLatent Thought Acceptance:")
     if total_latent_total > 0:
         latent_accept_rate = total_latent_accepted / total_latent_total
         print(f"  Accepted: {total_latent_accepted}/{total_latent_total} ({latent_accept_rate:.2%})")
+    else:
+        latent_accept_rate = 0.0
     
+    # Token acceptance
+    print(f"\nToken Acceptance:")
+    if total_tokens_total > 0:
+        token_accept_rate = total_tokens_accepted / total_tokens_total
+        print(f"  Accepted: {total_tokens_accepted}/{total_tokens_total} ({token_accept_rate:.2%})")
+    else:
+        token_accept_rate = 0.0
+    
+    # Model calls and speedup
     print(f"\nModel Calls:")
     print(f"  Draft model calls: {total_draft_calls}")
     print(f"  Target model calls: {total_target_calls}")
     print(f"  Total calls: {total_draft_calls + total_target_calls}")
-    print(f"  Baseline (target-only) calls: {total_target_only_calls}")
     
-    if total_target_only_calls > 0:
-        speedup = total_target_only_calls / (total_draft_calls + total_target_calls)
+    # Baseline: target-only would need one call per generated token
+    baseline_target_calls = total_generated_tokens
+    print(f"  Baseline (target-only) calls: {baseline_target_calls}")
+    
+    if baseline_target_calls > 0:
+        # Speedup = baseline_target_calls / total_target_calls
+        # (with parallel verification, we should have far fewer target calls)
+        speedup = baseline_target_calls / total_target_calls
         print(f"  Estimated speedup: {speedup:.2f}x")
+    else:
+        speedup = 0.0
     
     print(f"\nGeneration:")
     print(f"  Total tokens generated: {total_generated_tokens}")
@@ -257,12 +277,15 @@ def evaluate_speculative_decoding(
         "num_samples": num_samples,
         "latent_accepted": total_latent_accepted,
         "latent_total": total_latent_total,
-        "latent_accept_rate": latent_accept_rate if total_latent_total > 0 else 0.0,
+        "latent_accept_rate": latent_accept_rate,
+        "tokens_accepted": total_tokens_accepted,
+        "tokens_total": total_tokens_total,
+        "token_accept_rate": token_accept_rate,
         "draft_calls": total_draft_calls,
         "target_calls": total_target_calls,
         "total_calls": total_draft_calls + total_target_calls,
-        "baseline_calls": total_target_only_calls,
-        "estimated_speedup": speedup if total_target_only_calls > 0 else 0.0,
+        "baseline_calls": baseline_target_calls,
+        "estimated_speedup": speedup,
         "total_tokens": total_generated_tokens,
         "avg_tokens_per_sample": total_generated_tokens / num_samples if num_samples > 0 else 0.0,
     }
