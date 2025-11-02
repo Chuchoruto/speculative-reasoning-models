@@ -94,10 +94,6 @@ class DraftModel(nn.Module):
         
         max_n_latents = max([len(l) for l in latent_lists]) if latent_lists and max([len(l) for l in latent_lists]) > 0 else 0
         
-        # Debug: print latent positions for first batch (once)
-        if collect_latent_thoughts and input_ids.shape[0] > 0:
-            print(f"Debug: max_n_latents={max_n_latents}, latent_lists[0]={latent_lists[0] if len(latent_lists) > 0 else 'empty'}")
-        
         # Get earliest latent position for initial compute range (same as Coconut)
         if max_n_latents > 0:
             # Find minimum position across all samples
@@ -268,13 +264,6 @@ class DraftModel(nn.Module):
         
         # Return latent thoughts organized by sample, or None if not collected
         return_latent_thoughts = latent_thoughts_collected if collect_latent_thoughts else None
-        
-        # Debug: print collection summary
-        if collect_latent_thoughts:
-            num_samples_with_latents = sum(1 for latents in latent_thoughts_collected if len(latents) > 0)
-            total_latents_collected = sum(len(latents) for latents in latent_thoughts_collected)
-            print(f"Debug forward pass: {num_samples_with_latents}/{len(latent_thoughts_collected)} samples have latent thoughts, "
-                  f"total {total_latents_collected} latent thoughts collected")
         
         return Outputs(
             loss=loss,
