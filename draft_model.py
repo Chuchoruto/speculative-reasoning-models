@@ -60,6 +60,9 @@ class DraftModel(nn.Module):
         latent_positions=None,  # List[List[int]]: known latent token positions per sample
         **kwargs
     ):
+        # Clamp position_ids to max_position_embeddings before any forward pass
+        max_pos_embeddings = self.base_model.config.max_position_embeddings
+        position_ids = torch.clamp(position_ids, min=0, max=max_pos_embeddings - 1)
         """
         Forward pass with Coconut-style latent token processing.
         
@@ -94,21 +97,29 @@ class DraftModel(nn.Module):
         
         max_n_latents = max([len(l) for l in latent_lists]) if latent_lists and max([len(l) for l in latent_lists]) > 0 else 0
         
+        # Validate and clamp input_ids to prevent out-of-bounds embedding lookup
+        vocab_size = self.embedding.weight.shape[0]
+        if (input_ids >= vocab_size).any():
+            invalid_mask = input_ids >= vocab_size
+            invalid_count = invalid_mask.sum().item()
+            print(f"Warning: Draft model - {invalid_count} token IDs >= vocab_size ({vocab_size}), clamping")
+            input_ids = torch.clamp(input_ids, min=0, max=vocab_size - 1)
+        
+        # Initialize compute range
+        next_compute_range = (0, input_ids.shape[1])
+        inputs_embeds = self.embedding(input_ids)
+        
         # Get earliest latent position for initial compute range (same as Coconut)
         if max_n_latents > 0:
             # Find minimum position across all samples
             earliest_positions = [min(pos_list) for pos_list in latent_lists if len(pos_list) > 0]
             earliest_latent_pos = min(earliest_positions) if earliest_positions else 0
-        
-        next_compute_range = (0, input_ids.shape[1])
-        inputs_embeds = self.embedding(input_ids)
-        
-        if max_n_latents > 0:
             next_compute_range = (0, earliest_latent_pos)
         
         kv_cache = None
         
         # Process latent tokens (similar to Coconut)
+        # Only loop if there are latent tokens to process
         for pass_idx in range(max_n_latents):
             if kv_cache is None:
                 # First forward pass
@@ -236,28 +247,40 @@ class DraftModel(nn.Module):
             )
         
         # Final pass
-        outputs = self.base_model(
-            inputs_embeds=inputs_embeds[
-                :, next_compute_range[0] : next_compute_range[1], :
-            ],
-            attention_mask=attention_mask[:, : next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
-            output_hidden_states=True,
-        )
-        
-        logits.append(outputs.logits)
-        logits = torch.cat(logits, dim=-2)
+        # If there were latent tokens, kv_cache will be set. Otherwise, it's None and we process the whole sequence.
+        # next_compute_range should be (0, seq_len) if no latents, or (last_latent_pos+1, seq_len) if there were latents.
+        if max_n_latents == 0:
+            # No latent tokens: process entire sequence in one pass
+            outputs = self.base_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_hidden_states=True,
+            )
+            logits = outputs.logits
+        else:
+            # Had latent tokens: final pass on remaining sequence
+            outputs = self.base_model(
+                inputs_embeds=inputs_embeds[
+                    :, next_compute_range[0] : next_compute_range[1], :
+                ],
+                attention_mask=attention_mask[:, : next_compute_range[1]],
+                position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
+                past_key_values=(
+                    [
+                        (
+                            k[:, :, : next_compute_range[0], :],
+                            v[:, :, : next_compute_range[0], :],
+                        )
+                        for k, v in kv_cache
+                    ]
+                    if kv_cache
+                    else None
+                ),
+                output_hidden_states=True,
+            )
+            logits.append(outputs.logits)
+            logits = torch.cat(logits, dim=-2)
         
         # Placeholder loss (will be computed in training loop)
         loss = None

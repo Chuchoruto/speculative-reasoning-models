@@ -37,24 +37,50 @@ class Coconut(nn.Module):
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
 
-    def forward(self, input_ids, attention_mask, labels, position_ids, collect_latent_thoughts=False, **kwargs):
-
+    def forward(self, input_ids=None, attention_mask=None, labels=None, position_ids=None, collect_latent_thoughts=False, inputs_embeds=None, **kwargs):
+        
         logits = []
         latent_thoughts_collected = [] if collect_latent_thoughts else None
-
-        latent_indices = (
-            input_ids == self.latent_token_id
-        ).nonzero()  # (num_latent_tokens_in_the_batch, 2)
-
+        
+        # Handle inputs_embeds vs input_ids
+        if inputs_embeds is not None:
+            # Use provided embeddings directly
+            if input_ids is not None:
+                # Use input_ids to find latent positions
+                latent_indices = (
+                    input_ids == self.latent_token_id
+                ).nonzero()
+            else:
+                # If no input_ids, can't find latent positions
+                # Assume no latent tokens if inputs_embeds provided without input_ids
+                latent_indices = torch.empty((0, 2), dtype=torch.long, device=inputs_embeds.device)
+        else:
+            # Use input_ids to get embeddings and find latent positions
+            if input_ids is None:
+                raise ValueError("Either input_ids or inputs_embeds must be provided")
+            
+            latent_indices = (
+                input_ids == self.latent_token_id
+            ).nonzero()  # (num_latent_tokens_in_the_batch, 2)
+            
+            # Validate and clamp input_ids to prevent out-of-bounds embedding lookup
+            vocab_size = self.embedding.weight.shape[0]
+            if (input_ids >= vocab_size).any():
+                invalid_mask = input_ids >= vocab_size
+                invalid_count = invalid_mask.sum().item()
+                print(f"Warning: {invalid_count} token IDs >= vocab_size ({vocab_size}), clamping")
+                input_ids = torch.clamp(input_ids, min=0, max=vocab_size - 1)
+            
+            inputs_embeds = self.embedding(input_ids)
+        
         latent_lists = [
             [idx[1].item() for idx in latent_indices if idx[0] == i]
-            for i in range(input_ids.shape[0])
+            for i in range(inputs_embeds.shape[0])
         ]  # bs, num_latent_tokens_in_the_instance (difference across the batch)
-
+        
         max_n_latents = max([len(l) for l in latent_lists])
-
-        next_compute_range = (0, input_ids.shape[1])
-        inputs_embeds = self.embedding(input_ids)
+        
+        next_compute_range = (0, inputs_embeds.shape[1])
 
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
@@ -142,14 +168,28 @@ class Coconut(nn.Module):
                 for batch_idx in range(inputs_embeds.shape[0])
             ]
 
-            # replace some of them with continuous thoughts
+            # replace some of them with continuous thoughts (with bounds checks)
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
 
+                hidden_state_idx = token_idx - 1 - hidden_states_offset
+                token_in_range = (
+                    (token_idx - 1) >= hidden_states_offset and
+                    (token_idx - 1) < (hidden_states_offset + hidden_states.shape[1])
+                )
+                can_access_hidden_state = (
+                    token_in_range and
+                    hidden_state_idx >= 0 and
+                    hidden_state_idx < hidden_states.shape[1] and
+                    batch_idx < hidden_states.shape[0] and
+                    token_idx < inputs_embeds.shape[1]
+                )
+
+                if not can_access_hidden_state:
+                    continue
+
                 # Get the hidden state that will replace the latent token
-                thought_vector = hidden_states[
-                    batch_idx, token_idx - 1 - hidden_states_offset, :
-                ]
+                thought_vector = hidden_states[batch_idx, hidden_state_idx, :]
                 
                 # Collect latent thought if requested
                 if collect_latent_thoughts:
@@ -239,6 +279,9 @@ class Coconut(nn.Module):
 
         # get the first token using the current hidden state
         next_token = torch.argmax(outputs.logits[0, -1]).item()
+        # Validate token ID is within vocabulary
+        vocab_size = self.embedding.weight.shape[0]
+        next_token = min(max(0, next_token), vocab_size - 1)
         tokens.append(next_token)
         new_token_embed = self.embedding(
             torch.tensor(next_token, device=input_ids.device)
@@ -250,6 +293,9 @@ class Coconut(nn.Module):
             outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
             self.gen_forward_cnt += 1
             next_token = torch.argmax(outputs.logits[0, -1]).item()
+            # Validate token ID is within vocabulary
+            vocab_size = self.embedding.weight.shape[0]
+            next_token = min(max(0, next_token), vocab_size - 1)
             if next_token == self.eos_token_id:
                 break
             tokens.append(next_token)

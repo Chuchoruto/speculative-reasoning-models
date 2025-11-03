@@ -48,12 +48,15 @@ def evaluate_speculative_decoding(
     target_checkpoint_path: str,
     data_path: str = "data/gsm_test.json",
     num_latent_thoughts: int = 6,
-    gamma: int = 4,
+    gamma: int = 6,
     max_new_tokens: int = 50,
     similarity_threshold: float = 0.9,
     max_samples: int = 100,
     clock_run: str = "False",
     record_output: str = "False",
+    baseline_only: str = "False",
+    tokens_speculative: str = "False",
+    skip_latent_verification: str = "False",
 ):
     """
     Evaluate speculative decoding with draft and target models.
@@ -69,6 +72,9 @@ def evaluate_speculative_decoding(
         max_samples: Maximum number of samples to evaluate (default 100)
         clock_run: Enable wallclock timing. Accepts "True", "true", "1", "False", "false", "0" (default "False")
         record_output: Record generated outputs for comparison. Requires clock_run=True. Accepts "True", "true", "1", etc. (default "False")
+        baseline_only: Only run baseline (target model) decoding, skip speculative decoding. Accepts "True", "true", "1", etc. (default "False")
+        tokens_speculative: If True, use speculative decoding for tokens. If False, use autoregressive generation with target model only after latent thoughts. Accepts "True", "true", "1", etc. (default "False")
+        skip_latent_verification: If True, skip target model verification of latent thoughts (use draft only). Much faster. Accepts "True", "true", "1", etc. (default "False")
     """
     import json
     import sys
@@ -79,11 +85,24 @@ def evaluate_speculative_decoding(
     # Parse string parameters to boolean
     clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
     record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
+    baseline_only_bool = baseline_only.lower() in ("true", "1", "yes", "on")
+    tokens_speculative_bool = tokens_speculative.lower() in ("true", "1", "yes", "on")
+    skip_latent_verification_bool = skip_latent_verification.lower() in ("true", "1", "yes", "on")
+    
+    # If baseline_only is True, clock_run must also be True
+    if baseline_only_bool:
+        clock_run_bool = True
+        print("⚠️  Note: baseline_only=True implies clock_run=True")
+    
+    # If tokens_speculative is False, we need baseline comparison, so enable clock_run
+    if not tokens_speculative_bool:
+        clock_run_bool = True
+        print("⚠️  Note: tokens_speculative=False implies clock_run=True (for baseline comparison)")
     
     if record_output_bool and not clock_run_bool:
         print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
         record_output_bool = False
-    
+
     os.chdir("/workspace")
     sys.path.insert(0, "/workspace")
     
@@ -130,30 +149,34 @@ def evaluate_speculative_decoding(
     target_model = target_model.to(device)
     print("Target model loaded.")
     
-    # Load draft model
-    print(f"Loading draft model from {draft_checkpoint_path}...")
-    draft_base_model = AutoModelForCausalLM.from_pretrained("erwanf/gpt2-mini")
-    draft_base_model.resize_token_embeddings(len(tokenizer))
-    
-    from draft_model import DraftModel
-    draft_model = DraftModel(
-        draft_base_model,
-        latent_id,
-        start_id,
-        end_id,
-        eos_token_id,
-        hidden_dim_base=512,
-        hidden_dim_target=768,
-    )
-    
-    # Load draft checkpoint
-    checkpoint = torch.load(draft_checkpoint_path, map_location="cpu")
-    if "model_state_dict" in checkpoint:
-        draft_model.load_state_dict(checkpoint["model_state_dict"])
+    # Load draft model (only if not baseline_only)
+    draft_model = None
+    if not baseline_only_bool:
+        print(f"Loading draft model from {draft_checkpoint_path}...")
+        draft_base_model = AutoModelForCausalLM.from_pretrained("erwanf/gpt2-mini")
+        draft_base_model.resize_token_embeddings(len(tokenizer))
+        
+        from draft_model import DraftModel
+        draft_model = DraftModel(
+            draft_base_model,
+            latent_id,
+            start_id,
+            end_id,
+            eos_token_id,
+            hidden_dim_base=512,
+            hidden_dim_target=768,
+        )
+        
+        # Load draft checkpoint
+        checkpoint = torch.load(draft_checkpoint_path, map_location="cpu")
+        if "model_state_dict" in checkpoint:
+            draft_model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            draft_model.load_state_dict(checkpoint)
+        draft_model = draft_model.to(device)
+        print("Draft model loaded.")
     else:
-        draft_model.load_state_dict(checkpoint)
-    draft_model = draft_model.to(device)
-    print("Draft model loaded.")
+        print("⚠️  Skipping draft model loading (baseline_only=True)")
     
     # Load dataset
     print(f"Loading dataset from {data_path}...")
@@ -173,11 +196,23 @@ def evaluate_speculative_decoding(
     total_generated_tokens = 0
     num_samples = 0
     
-    # Timing metrics (only used if clock_run=True)
+    # Timing metrics
     total_speculative_time = 0.0
     total_baseline_time = 0.0
+    total_speculative_latent_time = 0.0
+    total_draft_latent_time = 0.0
+    total_verify_latent_time = 0.0
+    total_speculative_token_time = 0.0
+    total_baseline_latent_time = 0.0
+    total_baseline_token_time = 0.0
     per_sample_speculative_times = []
     per_sample_baseline_times = []
+    per_sample_speculative_latent_times = []
+    per_sample_speculative_token_times = []
+    per_sample_baseline_latent_times = []
+    per_sample_baseline_token_times = []
+    exact_matches = 0
+    total_comparisons = 0
     
     # Output recording (only used if record_output=True and clock_run=True)
     output_records = []
@@ -186,7 +221,10 @@ def evaluate_speculative_decoding(
         original_data = json.load(open(data_path))[:max_samples]
     
     # Evaluate each sample
-    print("\nStarting speculative decoding evaluation...")
+    if baseline_only_bool:
+        print("\nStarting baseline (target-only) evaluation...")
+    else:
+        print("\nStarting speculative decoding evaluation...")
     rng = np.random.default_rng(42)  # Fixed seed for reproducibility
     
     # Convert to list or iterate correctly
@@ -218,43 +256,60 @@ def evaluate_speculative_decoding(
         ]
         
         try:
-            # Run speculative decoding
-            generated_tokens, stats = speculative_decode(
-                draft_model,
-                target_model,
-                input_ids,
-                attention_mask,
-                position_ids,
-                latent_positions,
-                num_latent_thoughts=num_latent_thoughts,
-                gamma=gamma,
-                max_new_tokens=max_new_tokens,
-                eos_token_id=eos_token_id,
-                similarity_threshold=similarity_threshold,
-                device=device,
-                rng=rng,
-            )
+            generated_tokens = None
             
-            # Accumulate statistics
-            total_latent_accepted += stats['latent_accepted']
-            total_latent_total += stats['latent_total']
-            total_draft_calls += stats['num_draft_calls']
-            total_target_calls += stats['num_target_calls']
-            total_tokens_accepted += stats.get('tokens_accepted', 0)
-            total_tokens_total += stats.get('tokens_total', 0)
-            total_generated_tokens += len(generated_tokens)
-            
-            # Track timing
-            if clock_run_bool:
+            # Run speculative decoding (unless baseline_only)
+            if not baseline_only_bool:
+                # Run speculative decoding (latent thoughts always speculative, tokens conditional)
+                generated_tokens, stats = speculative_decode(
+                    draft_model,
+                    target_model,
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    latent_positions,
+                    num_latent_thoughts=num_latent_thoughts,
+                    gamma=gamma,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_token_id,
+                    similarity_threshold=similarity_threshold,
+                    device=device,
+                    rng=rng,
+                    tokens_speculative=tokens_speculative_bool,
+                    skip_latent_verification=skip_latent_verification_bool,
+                )
+                
+                # Accumulate statistics
+                total_latent_accepted += stats['latent_accepted']
+                total_latent_total += stats['latent_total']
+                total_draft_calls += stats['num_draft_calls']
+                total_target_calls += stats['num_target_calls']
+                total_tokens_accepted += stats.get('tokens_accepted', 0)
+                total_tokens_total += stats.get('tokens_total', 0)
+                total_generated_tokens += len(generated_tokens)
+                
+                # Track timing (always track if we have timing data)
                 speculative_time = stats.get('wallclock_time', 0.0)
+                speculative_latent_time = stats.get('latent_thought_time', 0.0)
+                draft_latent_time = stats.get('draft_latent_time', 0.0)
+                verify_latent_time = stats.get('verify_latent_time', 0.0)
+                speculative_token_time = stats.get('token_generation_time', 0.0)
                 total_speculative_time += speculative_time
+                total_speculative_latent_time += speculative_latent_time
+                total_draft_latent_time += draft_latent_time
+                total_verify_latent_time += verify_latent_time
+                total_speculative_token_time += speculative_token_time
                 per_sample_speculative_times.append(speculative_time)
+                per_sample_speculative_latent_times.append(speculative_latent_time)
+                per_sample_speculative_token_times.append(speculative_token_time)
+                
+                # Increment sample count for speculative decoding
+                num_samples += 1
             
-            num_samples += 1
-            
-            # If clock_run, also run baseline autoregressive decoding for comparison
-            if clock_run_bool:
-                baseline_tokens, baseline_time = baseline_autoregressive_decode(
+            # Always run baseline autoregressive decoding (for baseline_only or for comparison)
+            # If tokens_speculative=False, we need baseline to compare outputs and timing
+            if clock_run_bool or baseline_only_bool or not tokens_speculative_bool:
+                baseline_tokens, latent_thought_time, token_generation_time = baseline_autoregressive_decode(
                     target_model,
                     input_ids,
                     attention_mask,
@@ -265,11 +320,31 @@ def evaluate_speculative_decoding(
                     eos_token_id=eos_token_id,
                     device=device,
                 )
+                baseline_time = latent_thought_time + token_generation_time
                 total_baseline_time += baseline_time
+                total_baseline_latent_time += latent_thought_time
+                total_baseline_token_time += token_generation_time
                 per_sample_baseline_times.append(baseline_time)
+                per_sample_baseline_latent_times.append(latent_thought_time)
+                per_sample_baseline_token_times.append(token_generation_time)
+                
+                # Compare outputs if we have both
+                if generated_tokens is not None and baseline_tokens is not None:
+                    total_comparisons += 1
+                    if generated_tokens == baseline_tokens:
+                        exact_matches += 1
+                
+                # For baseline_only, use baseline_tokens as the generated tokens
+                if baseline_only_bool:
+                    generated_tokens = baseline_tokens
+                    total_generated_tokens += len(generated_tokens)
+                    num_samples += 1
+                else:
+                    # For speculative decoding, increment happens below
+                    pass
                 
                 # Record outputs if requested
-                if record_output_bool:
+                if record_output_bool and generated_tokens is not None:
                     # Decode tokens to text
                     spec_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                     baseline_text = tokenizer.decode(baseline_tokens, skip_special_tokens=True)
@@ -297,57 +372,99 @@ def evaluate_speculative_decoding(
     
     # Print results
     print("\n" + "=" * 60)
-    print("SPECULATIVE DECODING EVALUATION RESULTS")
+    if baseline_only_bool:
+        print("BASELINE (TARGET MODEL ONLY) EVALUATION RESULTS")
+    else:
+        print("SPECULATIVE DECODING EVALUATION RESULTS")
     print("=" * 60)
     print(f"Evaluated {num_samples} samples")
     
-    # Latent thought acceptance
-    print(f"\nLatent Thought Acceptance:")
-    if total_latent_total > 0:
-        latent_accept_rate = total_latent_accepted / total_latent_total
-        print(f"  Accepted: {total_latent_accepted}/{total_latent_total} ({latent_accept_rate:.2%})")
+    # Latent thought acceptance (only if not baseline_only)
+    if not baseline_only_bool:
+        print(f"\nLatent Thought Acceptance:")
+        if total_latent_total > 0:
+            latent_accept_rate = total_latent_accepted / total_latent_total
+            print(f"  Accepted: {total_latent_accepted}/{total_latent_total} ({latent_accept_rate:.2%})")
+        else:
+            latent_accept_rate = 0.0
+        
+        # Token acceptance
+        print(f"\nToken Acceptance:")
+        if total_tokens_total > 0:
+            token_accept_rate = total_tokens_accepted / total_tokens_total
+            print(f"  Accepted: {total_tokens_accepted}/{total_tokens_total} ({token_accept_rate:.2%})")
+        else:
+            token_accept_rate = 0.0
+        
+        # Model calls and speedup
+        print(f"\nModel Calls:")
+        print(f"  Draft model calls: {total_draft_calls}")
+        print(f"  Target model calls: {total_target_calls}")
+        print(f"  Total calls: {total_draft_calls + total_target_calls}")
+        
+        # Estimated speedup based on model calls
+        baseline_target_calls = total_generated_tokens
+        print(f"  Baseline (target-only) calls: {baseline_target_calls}")
+        
+        if baseline_target_calls > 0:
+            # Estimated speedup = baseline_target_calls / total_target_calls
+            # (with parallel verification, we should have far fewer target calls)
+            estimated_speedup = baseline_target_calls / total_target_calls
+            print(f"  Estimated speedup (based on calls): {estimated_speedup:.2f}x")
+        else:
+            estimated_speedup = 0.0
     else:
         latent_accept_rate = 0.0
-    
-    # Token acceptance
-    print(f"\nToken Acceptance:")
-    if total_tokens_total > 0:
-        token_accept_rate = total_tokens_accepted / total_tokens_total
-        print(f"  Accepted: {total_tokens_accepted}/{total_tokens_total} ({token_accept_rate:.2%})")
-    else:
         token_accept_rate = 0.0
-    
-    # Model calls and speedup
-    print(f"\nModel Calls:")
-    print(f"  Draft model calls: {total_draft_calls}")
-    print(f"  Target model calls: {total_target_calls}")
-    print(f"  Total calls: {total_draft_calls + total_target_calls}")
-    
-    # Estimated speedup based on model calls
-    baseline_target_calls = total_generated_tokens
-    print(f"  Baseline (target-only) calls: {baseline_target_calls}")
-    
-    if baseline_target_calls > 0:
-        # Estimated speedup = baseline_target_calls / total_target_calls
-        # (with parallel verification, we should have far fewer target calls)
-        estimated_speedup = baseline_target_calls / total_target_calls
-        print(f"  Estimated speedup (based on calls): {estimated_speedup:.2f}x")
-    else:
         estimated_speedup = 0.0
     
-    # Actual wallclock speedup (if clock_run enabled)
-    if clock_run_bool and num_samples > 0:
+    # Output comparison (if we ran both)
+    if total_comparisons > 0:
+        print(f"\nOutput Comparison:")
+        match_rate = exact_matches / total_comparisons
+        print(f"  Exact token matches: {exact_matches}/{total_comparisons} ({match_rate:.2%})")
+        if match_rate < 1.0:
+            print(f"  ⚠️  Warning: {total_comparisons - exact_matches} samples have mismatched outputs!")
+    
+    # Actual wallclock speedup (if baseline was run)
+    if total_baseline_time > 0 and num_samples > 0:
         print(f"\nWallclock Time Comparison:")
-        avg_speculative_time = total_speculative_time / num_samples
-        avg_baseline_time = total_baseline_time / num_samples
+        avg_speculative_time = total_speculative_time / num_samples if num_samples > 0 else 0.0
+        avg_baseline_time = total_baseline_time / num_samples if num_samples > 0 else 0.0
+        avg_spec_latent_time = total_speculative_latent_time / num_samples if num_samples > 0 else 0.0
+        avg_spec_token_time = total_speculative_token_time / num_samples if num_samples > 0 else 0.0
+        avg_base_latent_time = total_baseline_latent_time / num_samples if num_samples > 0 else 0.0
+        avg_base_token_time = total_baseline_token_time / num_samples if num_samples > 0 else 0.0
+        
         print(f"  Average speculative decoding time: {avg_speculative_time:.4f}s per sample")
         print(f"  Average baseline decoding time: {avg_baseline_time:.4f}s per sample")
         print(f"  Total speculative time: {total_speculative_time:.4f}s")
         print(f"  Total baseline time: {total_baseline_time:.4f}s")
         
+        print(f"\n  Speculative Time Breakdown:")
+        print(f"    Average latent thought generation time: {avg_spec_latent_time:.4f}s per sample")
+        avg_draft_latent_time = total_draft_latent_time / num_samples if num_samples > 0 else 0.0
+        avg_verify_latent_time = total_verify_latent_time / num_samples if num_samples > 0 else 0.0
+        print(f"      - Draft latent thought time: {avg_draft_latent_time:.4f}s per sample ({total_draft_latent_time:.4f}s total)")
+        print(f"      - Verify latent thought time: {avg_verify_latent_time:.4f}s per sample ({total_verify_latent_time:.4f}s total)")
+        print(f"    Average token generation time: {avg_spec_token_time:.4f}s per sample")
+        print(f"    Total latent thought time: {total_speculative_latent_time:.4f}s")
+        print(f"    Total token generation time: {total_speculative_token_time:.4f}s")
+        
+        print(f"\n  Baseline Time Breakdown:")
+        print(f"    Average latent thought generation time: {avg_base_latent_time:.4f}s per sample")
+        print(f"    Average token generation time: {avg_base_token_time:.4f}s per sample")
+        print(f"    Total latent thought time: {total_baseline_latent_time:.4f}s")
+        print(f"    Total token generation time: {total_baseline_token_time:.4f}s")
+        
         if avg_baseline_time > 0:
             actual_speedup = avg_baseline_time / avg_speculative_time
-            print(f"  Actual speedup (wallclock): {actual_speedup:.2f}x")
+            latent_speedup = avg_base_latent_time / avg_spec_latent_time if avg_spec_latent_time > 0 else 0.0
+            token_speedup = avg_base_token_time / avg_spec_token_time if avg_spec_token_time > 0 else 0.0
+            print(f"\n  Speedup Analysis:")
+            print(f"    Overall speedup: {actual_speedup:.2f}x")
+            print(f"    Latent thought speedup: {latent_speedup:.2f}x")
+            print(f"    Token generation speedup: {token_speedup:.2f}x")
             
             # Calculate min/max speedup per sample
             speedups_per_sample = [
@@ -355,12 +472,16 @@ def evaluate_speculative_decoding(
                 for baseline, spec in zip(per_sample_baseline_times, per_sample_speculative_times)
             ]
             if speedups_per_sample:
-                print(f"  Min speedup: {min(speedups_per_sample):.2f}x")
-                print(f"  Max speedup: {max(speedups_per_sample):.2f}x")
+                print(f"    Min overall speedup: {min(speedups_per_sample):.2f}x")
+                print(f"    Max overall speedup: {max(speedups_per_sample):.2f}x")
         else:
             actual_speedup = 0.0
+            latent_speedup = 0.0
+            token_speedup = 0.0
     else:
         actual_speedup = 0.0
+        latent_speedup = 0.0
+        token_speedup = 0.0
     
     print(f"\nGeneration:")
     print(f"  Total tokens generated: {total_generated_tokens}")
@@ -373,35 +494,62 @@ def evaluate_speculative_decoding(
     # Save results to file
     results = {
         "num_samples": num_samples,
-        "latent_accepted": total_latent_accepted,
-        "latent_total": total_latent_total,
-        "latent_accept_rate": latent_accept_rate,
-        "tokens_accepted": total_tokens_accepted,
-        "tokens_total": total_tokens_total,
-        "token_accept_rate": token_accept_rate,
-        "draft_calls": total_draft_calls,
-        "target_calls": total_target_calls,
-        "total_calls": total_draft_calls + total_target_calls,
-        "baseline_calls": baseline_target_calls,
-        "estimated_speedup": estimated_speedup,
+        "baseline_only": baseline_only_bool,
         "total_tokens": total_generated_tokens,
         "avg_tokens_per_sample": total_generated_tokens / num_samples if num_samples > 0 else 0.0,
     }
     
-    # Add timing results if clock_run enabled
-    if clock_run_bool:
+    # Add speculative decoding stats only if not baseline_only
+    if not baseline_only_bool:
         results.update({
-            "clock_run": True,
+            "latent_accepted": total_latent_accepted,
+            "latent_total": total_latent_total,
+            "latent_accept_rate": latent_accept_rate,
+            "tokens_accepted": total_tokens_accepted,
+            "tokens_total": total_tokens_total,
+            "token_accept_rate": token_accept_rate,
+            "draft_calls": total_draft_calls,
+            "target_calls": total_target_calls,
+            "total_calls": total_draft_calls + total_target_calls,
+            "baseline_calls": total_generated_tokens,
+            "estimated_speedup": estimated_speedup,
+        })
+    
+    # Add timing and comparison results
+    if total_baseline_time > 0:
+        results.update({
+            "baseline_comparison": True,
             "total_speculative_time": total_speculative_time,
             "total_baseline_time": total_baseline_time,
+            "total_speculative_latent_time": total_speculative_latent_time,
+            "total_draft_latent_time": total_draft_latent_time,
+            "total_verify_latent_time": total_verify_latent_time,
+            "total_speculative_token_time": total_speculative_token_time,
+            "total_baseline_latent_time": total_baseline_latent_time,
+            "total_baseline_token_time": total_baseline_token_time,
             "avg_speculative_time": total_speculative_time / num_samples if num_samples > 0 else 0.0,
             "avg_baseline_time": total_baseline_time / num_samples if num_samples > 0 else 0.0,
-            "actual_speedup": actual_speedup,
+            "avg_speculative_latent_time": total_speculative_latent_time / num_samples if num_samples > 0 else 0.0,
+            "avg_draft_latent_time": total_draft_latent_time / num_samples if num_samples > 0 else 0.0,
+            "avg_verify_latent_time": total_verify_latent_time / num_samples if num_samples > 0 else 0.0,
+            "avg_speculative_token_time": total_speculative_token_time / num_samples if num_samples > 0 else 0.0,
+            "avg_baseline_latent_time": total_baseline_latent_time / num_samples if num_samples > 0 else 0.0,
+            "avg_baseline_token_time": total_baseline_token_time / num_samples if num_samples > 0 else 0.0,
+            "overall_speedup": actual_speedup,
+            "latent_speedup": latent_speedup,
+            "token_speedup": token_speedup,
+            "exact_matches": exact_matches,
+            "total_comparisons": total_comparisons,
+            "match_rate": exact_matches / total_comparisons if total_comparisons > 0 else 0.0,
             "per_sample_speculative_times": per_sample_speculative_times,
             "per_sample_baseline_times": per_sample_baseline_times,
+            "per_sample_speculative_latent_times": per_sample_speculative_latent_times,
+            "per_sample_speculative_token_times": per_sample_speculative_token_times,
+            "per_sample_baseline_latent_times": per_sample_baseline_latent_times,
+            "per_sample_baseline_token_times": per_sample_baseline_token_times,
         })
     else:
-        results["clock_run"] = False
+        results["baseline_comparison"] = False
     
     results_path = "/checkpoints/speculative_decoding_results.json"
     with open(results_path, "w") as f:
@@ -463,6 +611,15 @@ def main():
     print("  - record-output: Record generated outputs for comparison (default: \"False\")")
     print("                  ⚠️  Requires clock-run=True. Accepts: \"True\", \"true\", \"1\", etc.")
     print("                  Saves outputs to /checkpoints/output_verification/output_comparison.json")
+    print("  - baseline-only: Only run baseline (target model) decoding, skip speculative decoding (default: \"False\")")
+    print("                  ⚠️  Accepts: \"True\", \"true\", \"1\", etc.")
+    print("                  When enabled, only runs target model and reports timing breakdown (latent + tokens)")
+    print("                  Note: baseline_only=True automatically enables clock_run=True")
+    print("  - tokens-speculative: Use speculative decoding for tokens (default: \"False\")")
+    print("                       ⚠️  Accepts: \"True\", \"true\", \"1\", etc.")
+    print("                       If False, uses autoregressive generation with target model only after latent thoughts")
+    print("                       If True, uses speculative decoding for tokens (draft + verify)")
+    print("                       Note: Latent thoughts always use speculative decoding (draft + verify)")
     print()
     print("Examples:")
     print("  # Use higher gamma for better parallelization:")
@@ -484,4 +641,3 @@ def main():
     if True:  # Always show this option
         print("  - Actual wallclock speedup (if --clock-run True)")
     print("  - Generation statistics")
-

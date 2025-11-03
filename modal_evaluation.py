@@ -96,10 +96,53 @@ def evaluate_model(checkpoint_path: str):
     print("Evaluation completed!")
     print("Check the logs for final test accuracy results")
 
+@app.function(
+    image=image,
+    gpu="A100:4",
+    timeout=60 * 60 * 2,  # 2 hour timeout for evaluation
+    volumes={"/checkpoints": checkpoint_volume},  # Mount same volume
+    secrets=[modal.Secret.from_name("wandb")],
+)
+def evaluate_prontoqa_model(checkpoint_path: str):
+    """Evaluate the trained ProntoQA Coconut model with 4x A100 GPUs"""
+    import subprocess
+    import os
+    
+    os.chdir("/workspace")
+    
+    print(f"Evaluating ProntoQA model from: {checkpoint_path}")
+    
+    # Load the prontoqa eval config
+    with open("args/prontoqa_coconut_eval.yaml", "r") as f:
+        config_dict = yaml.safe_load(f)
+    
+    # Update the checkpoint path and save_path
+    config_dict["load_model_path"] = checkpoint_path
+    config_dict["save_path"] = "/checkpoints"
+    
+    with open("prontoqa_eval_modal.yaml", "w") as f:
+        yaml.dump(config_dict, f)
+    
+    print("Starting evaluation on ProntoQA test set...")
+    print(f"Config: {config_dict}")
+    
+    subprocess.run([
+        "torchrun",
+        "--nnodes", "1",
+        "--nproc_per_node", "4",
+        "run.py",
+        "prontoqa_eval_modal.yaml"
+    ], check=True)
+    
+    print("Evaluation completed!")
+    print("Check the logs for final test accuracy results")
+
 @app.local_entrypoint()
 def main():
-    print("Starting GSM8K Model Evaluation...")
+    print("Starting Model Evaluation...")
     print("Make sure you have completed Coconut training first!")
     print("You need to specify the best Coconut checkpoint path.")
-    print("Example usage:")
+    print("\nFor GSM8K evaluation:")
     print("modal run modal_evaluation.py::evaluate_model --checkpoint-path '/checkpoints/gsm-coconut/checkpoint_25'")
+    print("\nFor ProntoQA evaluation:")
+    print("modal run modal_evaluation.py::evaluate_prontoqa_model --checkpoint-path '/checkpoints/prontoqa-coconut/checkpoint_50'")

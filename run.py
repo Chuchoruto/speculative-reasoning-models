@@ -439,6 +439,9 @@ def main():
             torch.tensor(0, device=rank),
         )
 
+        # Collect outputs for saving when only_eval is True
+        output_records = [] if (configs.only_eval and rank == 0) else None
+
         with torch.no_grad():
             parallel_model.module.eval()
             for idx, batch in enumerate(valid_gen_dataloader):
@@ -465,6 +468,10 @@ def main():
                     synced_gpus=not configs.only_eval,
                 )
 
+                # Get raw tokens (EXACTLY what the model generates)
+                generated_tokens = outputs[0].cpu().tolist()
+                
+                # Decode to text
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()
                 cot_output = (
@@ -478,6 +485,21 @@ def main():
                     )
                     print(f"Full output: '{tokenizer.decode(outputs[0])}'")
                     print(f"Extracted Output: '{answer_output}'")
+
+                # Save output record when only_eval is True
+                if output_records is not None:
+                    output_records.append({
+                        "sample_idx": int(test_idx.cpu().item()),
+                        "question": question,
+                        "ground_truth_answer": answer,
+                        "ground_truth_cot": answer_cot,
+                        "generated_tokens": generated_tokens,
+                        "generated_text": text_output,
+                        "extracted_answer": answer_output,
+                        "extracted_cot": cot_output,
+                        "answer_match": bool(answer_output == answer),
+                        "cot_match": bool(cot_output == answer_cot),
+                    })
 
                 cor += answer_output == answer
                 cor_cot += cot_output == answer_cot
@@ -504,6 +526,30 @@ def main():
 
         if wandb_run:
             wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+
+        # Save outputs when only_eval is True
+        if configs.only_eval and rank == 0 and output_records is not None:
+            # Save to checkpoints directory
+            output_dir = os.path.join(configs.save_path, "evaluation_outputs")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Save individual outputs
+            output_file = os.path.join(output_dir, f"{configs.name}_outputs.json")
+            with open(output_file, "w") as f:
+                json.dump(output_records, f, indent=2)
+            print(f"Saved {len(output_records)} output records to {output_file}")
+            
+            # Save summary comparison
+            comparison_data = {
+                "total_samples": len(output_records),
+                "answer_accuracy": cor / total,
+                "cot_accuracy": cor_cot / total,
+                "samples": output_records
+            }
+            comparison_file = os.path.join(output_dir, f"{configs.name}_comparison.json")
+            with open(comparison_file, "w") as f:
+                json.dump(comparison_data, f, indent=2)
+            print(f"Saved comparison data to {comparison_file}")
 
         if configs.only_eval:
             break

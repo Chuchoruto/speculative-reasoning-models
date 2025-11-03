@@ -82,11 +82,19 @@ def speculative_decode_latent_thoughts(
     position_ids: torch.Tensor,
     latent_positions: List[int],
     num_latent_thoughts: int = 6,
+    gamma: int = 6,  # Unused, kept for API compatibility
     similarity_threshold: float = 0.9,
     device: torch.device = None,
-) -> Tuple[List[bool], List[torch.Tensor], List[torch.Tensor]]:
+) -> Tuple[List[bool], List[torch.Tensor], List[torch.Tensor], float, float]:
     """
-    Generate and verify latent thoughts between draft and target models.
+    Generate draft latent thoughts sequentially (6 autoregressive calls),
+    then verify all with target model in one parallel call.
+    
+    Process:
+    1. Draft model generates latent thoughts sequentially (one per position)
+    2. Construct input sequence with draft latent thoughts embedded
+    3. Target model processes this sequence in ONE call, generating target latent thoughts
+    4. Compare each draft latent with corresponding target latent
     
     Args:
         draft_model: Draft model instance
@@ -94,78 +102,154 @@ def speculative_decode_latent_thoughts(
         input_ids: Input sequence [seq_len]
         attention_mask: Attention mask [seq_len]
         position_ids: Position IDs [seq_len]
-        latent_positions: Positions of latent tokens in sequence
-        num_latent_thoughts: Number of latent thoughts to generate (default 6)
+        latent_positions: Positions of latent tokens in sequence (sorted)
+        num_latent_thoughts: Total number of latent thoughts to generate (default 6)
+        gamma: Unused (kept for API compatibility)
         similarity_threshold: Cosine similarity threshold for acceptance
         device: Device to run on
     
     Returns:
-        (acceptance_list, draft_thoughts, target_thoughts)
+        (acceptance_list, draft_thoughts, target_thoughts, draft_time, verify_time)
+        - draft_time: Time taken to generate draft latent thoughts
+        - verify_time: Time taken to verify with target model
     """
     if device is None:
         device = input_ids.device
     
     # Expand to batch dimension
-    input_ids = input_ids.unsqueeze(0).to(device)
-    attention_mask = attention_mask.unsqueeze(0).to(device)
-    position_ids = position_ids.unsqueeze(0).to(device)
+    input_ids_batch = input_ids.unsqueeze(0).to(device)
+    attention_mask_batch = attention_mask.unsqueeze(0).to(device)
+    position_ids_batch = position_ids.unsqueeze(0).to(device)
     
-    # Generate draft latent thoughts
     draft_model.eval()
-    with torch.no_grad():
-        draft_outputs = draft_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            collect_latent_thoughts=True,
-            latent_positions=[latent_positions],
-        )
-        # Draft model returns latent thoughts on GPU (from the model), convert to device
-        draft_thoughts = [
-            thought.to(device) if isinstance(thought, torch.Tensor) else thought
-            for thought in (draft_outputs.latent_thoughts[0] if draft_outputs.latent_thoughts else [])
-        ]
-    
-    # Generate target latent thoughts
     target_model.eval()
+    
+    # Sort latent positions to ensure sequential processing
+    sorted_latent_positions = sorted(latent_positions)[:num_latent_thoughts]
+    
+    # Step 1: Generate draft latent thoughts SEQUENTIALLY
+    # The draft model processes latent tokens sequentially in its forward pass,
+    # so each latent thought depends on previous ones (draft_latent 1 -> draft_latent 2, etc.)
+    # We call it once with all positions - it handles sequential processing internally
+    all_draft_thoughts = []
+    
+    # Time the draft generation
+    draft_start_time = time.perf_counter()
     with torch.no_grad():
-        # Coconut model requires labels (can be dummy)
+        # Call draft model once - it processes all latent positions sequentially internally
+        # Each latent thought is generated autoregressively (depends on previous ones)
+        draft_outputs = draft_model(
+            input_ids=input_ids_batch,
+            attention_mask=attention_mask_batch,
+            position_ids=position_ids_batch,
+            collect_latent_thoughts=True,
+            latent_positions=[sorted_latent_positions],  # All positions at once
+        )
+        
+        # Extract all draft latent thoughts (already projected to 768-dim)
+        if draft_outputs.latent_thoughts and len(draft_outputs.latent_thoughts[0]) > 0:
+            all_draft_thoughts = [
+                thought.to(device) if isinstance(thought, torch.Tensor) else torch.tensor(thought, device=device)
+                for thought in draft_outputs.latent_thoughts[0]
+            ]
+    draft_end_time = time.perf_counter()
+    draft_time = draft_end_time - draft_start_time
+    
+    # Step 2: Construct input sequence with ALL draft latent thoughts embedded
+    # Get base embeddings from target model
+    with torch.no_grad():
+        base_embeddings = target_model.embedding(input_ids_batch)
+        
+        # Replace latent token positions with draft latent thoughts (768-dim)
+        for i, latent_pos in enumerate(sorted_latent_positions):
+            if i < len(all_draft_thoughts):
+                # Target model expects 768-dim embeddings
+                base_embeddings[0, latent_pos, :] = all_draft_thoughts[i]
+    
+    # Step 3: Target model verifies in ONE batched call using 6 parallel sequences
+    # Build a batch where sample k has first k-1 latent tokens replaced by draft thoughts
+    # and only the k-th position remains a latent token to collect one thought per batch row
+    verify_start_time = time.perf_counter()
+    with torch.no_grad():
+        batch_input_ids = []
+        batch_attention = []
+        batch_positions = []
+        batch_embeddings = []
+        # Use model-known special ids
+        latent_id = getattr(target_model, 'latent_token_id', None)
+        end_latent_id = getattr(target_model, 'end_latent_id', None)
+        # Fallback: keep the same id if not available
+        for k, pos_k in enumerate(sorted_latent_positions, start=1):
+            # Start from device tensors
+            ids_k = input_ids_batch[0].clone()  # [L] on device
+            # Ensure exactly ONE latent token remains at pos_k.
+            # All other latent positions are set to a non-latent token (end_latent or eos) to avoid multiple latents.
+            neutral_id = None
+            if hasattr(target_model, 'end_latent_id') and target_model.end_latent_id is not None:
+                neutral_id = target_model.end_latent_id
+            elif hasattr(target_model, 'eos_token_id') and target_model.eos_token_id is not None:
+                neutral_id = target_model.eos_token_id
+            else:
+                # Fallback: if we don't have a neutral id, keep original id (worst case)
+                neutral_id = ids_k[pos_k].item()
+            for p in sorted_latent_positions:
+                if p != pos_k:
+                    ids_k[p] = neutral_id
+            # Build embeddings and overwrite previous positions with draft thoughts
+            emb_k = target_model.embedding(ids_k.unsqueeze(0))  # [1, L, 768] on device
+            for i_thought, prev_pos in enumerate(sorted_latent_positions[:k-1]):
+                if i_thought < len(all_draft_thoughts):
+                    emb_k[0, prev_pos, :] = all_draft_thoughts[i_thought]
+            batch_input_ids.append(ids_k.unsqueeze(0))
+            batch_attention.append(attention_mask_batch[0].unsqueeze(0))
+            batch_positions.append(position_ids_batch[0].unsqueeze(0))
+            batch_embeddings.append(emb_k)
+        # Stack batch
+        batch_input_ids = torch.cat(batch_input_ids, dim=0).to(device)
+        batch_attention = torch.cat(batch_attention, dim=0).to(device)
+        batch_positions = torch.cat(batch_positions, dim=0).to(device)
+        batch_embeddings = torch.cat(batch_embeddings, dim=0).to(device)
         dummy_labels = torch.full(
-            (input_ids.shape[0], input_ids.shape[1]),
+            (batch_input_ids.shape[0], batch_input_ids.shape[1]),
             -100,
             dtype=torch.long,
-            device=device
+            device=device,
         )
+        # One forward pass for all k
         target_outputs = target_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+            input_ids=batch_input_ids,
+            attention_mask=batch_attention,
+            position_ids=batch_positions,
             labels=dummy_labels,
             collect_latent_thoughts=True,
+            inputs_embeds=batch_embeddings,
         )
-        # Coconut model returns latent thoughts on CPU (via .clone().cpu()), convert to device
-        target_thoughts = [
-            thought.to(device) if isinstance(thought, torch.Tensor) else thought
-            for thought in (target_outputs.latent_thoughts if target_outputs.latent_thoughts else [])
+        # With one latent per batch row, the model will collect exactly one thought per row in batch order
+        raw_thoughts = target_outputs.latent_thoughts if target_outputs.latent_thoughts else []
+        all_target_thoughts = [
+            t.to(device) if isinstance(t, torch.Tensor) else torch.tensor(t, device=device)
+            for t in raw_thoughts
         ]
+    verify_end_time = time.perf_counter()
+    verify_time = verify_end_time - verify_start_time
     
-    # Verify each latent thought
-    acceptance_list = []
-    min_len = min(len(draft_thoughts), len(target_thoughts), num_latent_thoughts)
+    # Step 4: Verify all latent thoughts in parallel
+    all_acceptance = []
+    min_len = min(len(all_draft_thoughts), len(all_target_thoughts), num_latent_thoughts)
     
     for i in range(min_len):
-        # Both tensors should already be on device, but ensure they are
-        draft_vec = draft_thoughts[i] if isinstance(draft_thoughts[i], torch.Tensor) else torch.tensor(draft_thoughts[i], device=device)
-        target_vec = target_thoughts[i] if isinstance(target_thoughts[i], torch.Tensor) else torch.tensor(target_thoughts[i], device=device)
+        draft_vec = all_draft_thoughts[i]
+        target_vec = all_target_thoughts[i]
         
         accepted = accept_latent_thought(
             draft_vec,
             target_vec,
             threshold=similarity_threshold
         )
-        acceptance_list.append(accepted)
+        all_acceptance.append(accepted)
     
-    return acceptance_list, draft_thoughts[:min_len], target_thoughts[:min_len]
+    # Return only the verified thoughts (slice to min_len)
+    return all_acceptance, all_draft_thoughts[:min_len], all_target_thoughts[:min_len], draft_time, verify_time
 
 
 def speculative_decode_tokens(
@@ -240,9 +324,8 @@ def speculative_decode_tokens(
                 draft_logits = draft_outputs.logits[0, -1, :]  # Last position logits
                 draft_logits_list.append(draft_logits)
                 
-                # Sample from draft distribution
-                draft_probs = F.softmax(draft_logits, dim=-1)
-                draft_token = torch.multinomial(draft_probs, 1).item()
+                # Greedy decoding: use argmax
+                draft_token = torch.argmax(draft_logits, dim=-1).item()
                 draft_tokens.append(draft_token)
                 
                 # Append to input for next draft token
@@ -319,41 +402,26 @@ def speculative_decode_tokens(
         for i, draft_token in enumerate(draft_tokens):
             tokens_total += 1
             
-            # Get probabilities for this position
+            # Get logits for this position
             target_logits_i = target_logits_all[i, :]  # [vocab_size]
-            target_probs_i = F.softmax(target_logits_i, dim=-1)
-            draft_probs_i = F.softmax(draft_logits_list[i], dim=-1)
+            draft_logits_i = draft_logits_list[i]  # [vocab_size]
             
-            draft_prob = draft_probs_i[draft_token].item()
-            target_prob = target_probs_i[draft_token].item()
+            # Greedy decoding: get argmax for both models
+            draft_argmax = torch.argmax(draft_logits_i, dim=-1).item()
+            target_argmax = torch.argmax(target_logits_i, dim=-1).item()
             
-            # Speculative decoding acceptance
-            accepted, _ = accept_token_speculative(
-                draft_prob,
-                target_prob,
-                rng=rng
-            )
+            # Strict acceptance: only accept if argmax matches
+            accepted = (draft_argmax == target_argmax)
             
             if accepted:
-                verified_tokens.append(draft_token)
+                # Use the target model's argmax (which matches draft)
+                verified_tokens.append(target_argmax)
                 tokens_accepted += 1
             else:
-                # Rejected: sample from adjusted distribution
+                # Rejected: use target model's argmax and stop
                 all_accepted = False
                 first_rejection_idx = i
-                
-                # Adjusted distribution: norm(max(0, p(x) - q(x)))
-                adjusted_probs = torch.clamp(target_probs_i - draft_probs_i, min=0.0)
-                adjusted_sum = adjusted_probs.sum()
-                
-                if adjusted_sum > 0:
-                    adjusted_probs = adjusted_probs / adjusted_sum
-                    sampled_token = torch.multinomial(adjusted_probs, 1).item()
-                else:
-                    # Fallback: sample from target distribution
-                    sampled_token = torch.multinomial(target_probs_i, 1).item()
-                
-                verified_tokens.append(sampled_token)
+                verified_tokens.append(target_argmax)  # Use target's argmax
                 break  # Stop after first rejection
         
         # Add verified tokens to output
@@ -384,6 +452,85 @@ def speculative_decode_tokens(
     return generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total
 
 
+def autoregressive_token_generation(
+    target_model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    max_new_tokens: int = 50,
+    eos_token_id: int = None,
+    device: torch.device = None,
+) -> List[int]:
+    """
+    Generate tokens autoregressively using only the target model.
+    
+    Args:
+        target_model: Target (Coconut) model instance
+        input_ids: Input sequence [seq_len]
+        attention_mask: Attention mask [seq_len]
+        position_ids: Position IDs [seq_len]
+        max_new_tokens: Maximum new tokens to generate
+        eos_token_id: EOS token ID
+        device: Device to run on
+    
+    Returns:
+        generated_tokens: List of generated token IDs
+    """
+    if device is None:
+        device = input_ids.device
+    
+    target_model.eval()
+    
+    # Expand to batch dimension
+    current_input_ids = input_ids.unsqueeze(0).to(device)
+    current_attention_mask = attention_mask.unsqueeze(0).to(device)
+    current_position_ids = position_ids.unsqueeze(0).to(device)
+    
+    generated_tokens = []
+    
+    # Autoregressive generation
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            dummy_labels = torch.full(
+                (current_input_ids.shape[0], current_input_ids.shape[1]),
+                -100,
+                dtype=torch.long,
+                device=device
+            )
+            outputs = target_model(
+                input_ids=current_input_ids,
+                attention_mask=current_attention_mask,
+                position_ids=current_position_ids,
+                labels=dummy_labels,
+                collect_latent_thoughts=False,
+            )
+            
+            # Get next token (greedy decoding)
+            next_token_logits = outputs.logits[0, -1, :]
+            next_token = torch.argmax(next_token_logits).item()
+            generated_tokens.append(next_token)
+            
+            # Check for EOS
+            if eos_token_id is not None and next_token == eos_token_id:
+                break
+            
+            # Append to input for next iteration
+            current_input_ids = torch.cat([
+                current_input_ids,
+                torch.tensor([[next_token]], device=device)
+            ], dim=1)
+            current_attention_mask = torch.cat([
+                current_attention_mask,
+                torch.ones((1, 1), device=device, dtype=torch.long)
+            ], dim=1)
+            current_position_ids = torch.cat([
+                current_position_ids,
+                torch.tensor([[current_position_ids[0, -1].item() + 1]], device=device)
+            ], dim=1)
+    
+    return generated_tokens
+
+
 def speculative_decode(
     draft_model,
     target_model,
@@ -392,12 +539,14 @@ def speculative_decode(
     position_ids: torch.Tensor,
     latent_positions: List[int],
     num_latent_thoughts: int = 6,
-    gamma: int = 4,
+    gamma: int = 6,
     max_new_tokens: int = 50,
     eos_token_id: int = None,
     similarity_threshold: float = 0.9,
     device: torch.device = None,
     rng: Optional[np.random.Generator] = None,
+    tokens_speculative: bool = False,
+    skip_latent_verification: bool = False,
 ) -> Tuple[List[int], dict]:
     """
     Full speculative decoding pipeline: latent thoughts + tokens.
@@ -410,12 +559,14 @@ def speculative_decode(
         position_ids: Position IDs [seq_len]
         latent_positions: Positions of latent tokens
         num_latent_thoughts: Number of latent thoughts (default 6)
-        gamma: Number of draft tokens per round
+        gamma: Number of draft tokens per round (for tokens). Note: latent thoughts are now processed all at once (no batching)
         max_new_tokens: Maximum new tokens to generate
         eos_token_id: EOS token ID
         similarity_threshold: Cosine similarity threshold for latent thoughts
         device: Device to run on
         rng: Random number generator
+        tokens_speculative: If True, use speculative decoding for tokens. If False, use autoregressive generation with target model only.
+        skip_latent_verification: If True, skip target model verification of latent thoughts (use draft only). Much faster but less accurate.
     
     Returns:
         (generated_tokens, stats_dict)
@@ -436,21 +587,69 @@ def speculative_decode(
     # Track wallclock time for speculative decoding
     start_time = time.perf_counter()
     
-    # Step 1: Generate and verify latent thoughts
-    acceptance_list, draft_thoughts, target_thoughts = speculative_decode_latent_thoughts(
-        draft_model,
-        target_model,
-        input_ids,
-        attention_mask,
-        position_ids,
-        latent_positions,
-        num_latent_thoughts=num_latent_thoughts,
-        similarity_threshold=similarity_threshold,
-        device=device,
-    )
+    # Step 1: Generate latent thoughts
+    latent_start_time = time.perf_counter()
+    draft_latent_time = 0.0
+    verify_latent_time = 0.0
+    
+    if skip_latent_verification:
+        # Only use draft model - skip target verification for speed
+        input_ids_batch = input_ids.unsqueeze(0).to(device)
+        attention_mask_batch = attention_mask.unsqueeze(0).to(device)
+        position_ids_batch = position_ids.unsqueeze(0).to(device)
+        
+        draft_model.eval()
+        draft_gen_start = time.perf_counter()
+        with torch.no_grad():
+            draft_outputs = draft_model(
+                input_ids=input_ids_batch,
+                attention_mask=attention_mask_batch,
+                position_ids=position_ids_batch,
+                collect_latent_thoughts=True,
+                latent_positions=[latent_positions],
+            )
+            draft_thoughts = [
+                thought.to(device) if isinstance(thought, torch.Tensor) else torch.tensor(thought, device=device)
+                for thought in (draft_outputs.latent_thoughts[0] if draft_outputs.latent_thoughts else [])
+            ]
+        draft_gen_end = time.perf_counter()
+        
+        # Accept all draft thoughts without verification
+        acceptance_list = [True] * min(len(draft_thoughts), num_latent_thoughts)
+        target_thoughts = draft_thoughts[:num_latent_thoughts] if len(draft_thoughts) >= num_latent_thoughts else draft_thoughts
+        
+        stats['num_draft_calls'] = 1
+        stats['num_target_calls'] = 0  # No target call for latent thoughts!
+        
+        # Time draft generation
+        draft_latent_time = draft_gen_end - draft_gen_start
+        verify_latent_time = 0.0  # No verification
+    else:
+        # Generate and verify with both models
+        acceptance_list, draft_thoughts, target_thoughts, draft_latent_time, verify_latent_time = speculative_decode_latent_thoughts(
+            draft_model,
+            target_model,
+            input_ids,
+            attention_mask,
+            position_ids,
+            latent_positions,
+            num_latent_thoughts=num_latent_thoughts,
+            gamma=gamma,
+            similarity_threshold=similarity_threshold,
+            device=device,
+        )
+        # Count draft calls for latent thoughts (now just one call for all thoughts)
+        stats['num_draft_calls'] = 1  # Draft model called once for all latent thoughts
+        stats['num_target_calls'] = 1  # Target model called once for all latent thoughts (parallel verification)
+    
+    latent_end_time = time.perf_counter()
+    latent_time = latent_end_time - latent_start_time
     
     stats['latent_accepted'] = sum(acceptance_list)
     stats['latent_total'] = len(acceptance_list)
+    stats['latent_thought_time'] = latent_time
+    stats['draft_latent_time'] = draft_latent_time
+    stats['verify_latent_time'] = verify_latent_time
     
     # If not all latent thoughts accepted, we might need to handle this
     # For now, continue with token generation regardless
@@ -477,27 +676,46 @@ def speculative_decode(
         token_attention_mask = attention_mask.clone()
         token_position_ids = position_ids.clone()
     
-    # Generate tokens with speculative decoding
-    # This will generate new tokens after the latent thought section
-    generated_tokens, num_draft, num_target, tokens_accepted, tokens_total = speculative_decode_tokens(
-        draft_model,
-        target_model,
-        token_input_ids,
-        token_attention_mask,
-        token_position_ids,
-        gamma=gamma,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=eos_token_id,
-        device=device,
-        rng=rng,
-    )
+    # Generate tokens: either speculative decoding or normal autoregressive
+    token_start_time = time.perf_counter()
+    if tokens_speculative:
+        # Use speculative decoding for tokens
+        generated_tokens, num_draft_tokens, num_target_tokens, tokens_accepted, tokens_total = speculative_decode_tokens(
+            draft_model,
+            target_model,
+            token_input_ids,
+            token_attention_mask,
+            token_position_ids,
+            gamma=gamma,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            device=device,
+            rng=rng,
+        )
+        stats['num_draft_calls'] += num_draft_tokens
+        stats['num_target_calls'] += num_target_tokens
+        stats['tokens_accepted'] = tokens_accepted
+        stats['tokens_total'] = tokens_total
+    else:
+        # Use normal autoregressive generation with target model only
+        generated_tokens = autoregressive_token_generation(
+            target_model,
+            token_input_ids,
+            token_attention_mask,
+            token_position_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            device=device,
+        )
+        # Count target model calls: one per token generated
+        stats['num_target_calls'] += len(generated_tokens)
+        stats['tokens_accepted'] = len(generated_tokens)  # All tokens are "accepted" (no rejection in autoregressive)
+        stats['tokens_total'] = len(generated_tokens)
+    token_end_time = time.perf_counter()
+    token_time = token_end_time - token_start_time
+    stats['token_generation_time'] = token_time
     
-    stats['num_draft_calls'] = num_draft
-    stats['num_target_calls'] = num_target
-    stats['tokens_accepted'] = tokens_accepted
-    stats['tokens_total'] = tokens_total
-    
-    # Record wallclock time
+    # Record total wallclock time
     end_time = time.perf_counter()
     stats['wallclock_time'] = end_time - start_time
     
@@ -514,10 +732,11 @@ def baseline_autoregressive_decode(
     max_new_tokens: int = 50,
     eos_token_id: int = None,
     device: torch.device = None,
-) -> Tuple[List[int], float]:
+) -> Tuple[List[int], float, float]:
     """
     Baseline autoregressive generation using only the target model.
-    Processes latent thoughts and then generates tokens autoregressively.
+    Generates latent thought vectors first, then generates tokens autoregressively.
+    Tracks separate wall clock times for each phase.
     
     Args:
         target_model: Target (Coconut) model instance
@@ -531,23 +750,23 @@ def baseline_autoregressive_decode(
         device: Device to run on
     
     Returns:
-        (generated_tokens, wallclock_time)
+        (generated_tokens, latent_thought_time, token_generation_time)
+        - latent_thought_time: Time to generate latent thought vectors
+        - token_generation_time: Time to generate tokens autoregressively
     """
     if device is None:
         device = input_ids.device
     
     target_model.eval()
     
-    # Track wallclock time
-    start_time = time.perf_counter()
-    
     # Expand to batch dimension
     input_ids_batch = input_ids.unsqueeze(0).to(device)
     attention_mask_batch = attention_mask.unsqueeze(0).to(device)
     position_ids_batch = position_ids.unsqueeze(0).to(device)
     
-    # Process latent thoughts first (similar to Coconut forward pass)
-    # Create dummy labels for forward pass
+    # Step 1: Generate latent thought vectors and time it
+    latent_start_time = time.perf_counter()
+    
     dummy_labels = torch.full(
         (input_ids_batch.shape[0], input_ids_batch.shape[1]),
         -100,
@@ -555,15 +774,18 @@ def baseline_autoregressive_decode(
         device=device
     )
     
-    # Forward pass through Coconut model to process latent tokens
+    # Forward pass through Coconut model to generate latent thoughts
     with torch.no_grad():
         outputs = target_model(
             input_ids=input_ids_batch,
             attention_mask=attention_mask_batch,
             position_ids=position_ids_batch,
             labels=dummy_labels,
-            collect_latent_thoughts=False,
+            collect_latent_thoughts=True,  # Collect latent thoughts
         )
+    
+    latent_end_time = time.perf_counter()
+    latent_thought_time = latent_end_time - latent_start_time
     
     # Get the position after latent tokens
     if len(latent_positions) > 0:
@@ -586,6 +808,9 @@ def baseline_autoregressive_decode(
     current_input_ids = current_input_ids.unsqueeze(0)
     current_attention_mask = current_attention_mask.unsqueeze(0)
     current_position_ids = current_position_ids.unsqueeze(0)
+    
+    # Step 2: Generate tokens autoregressively and time it
+    token_start_time = time.perf_counter()
     
     generated_tokens = []
     
@@ -629,9 +854,7 @@ def baseline_autoregressive_decode(
                 torch.tensor([[current_position_ids[0, -1].item() + 1]], device=device)
             ], dim=1)
     
-    # Record wallclock time
-    end_time = time.perf_counter()
-    wallclock_time = end_time - start_time
+    token_end_time = time.perf_counter()
+    token_generation_time = token_end_time - token_start_time
     
-    return generated_tokens, wallclock_time
-
+    return generated_tokens, latent_thought_time, token_generation_time
