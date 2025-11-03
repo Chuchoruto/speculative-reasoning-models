@@ -6,8 +6,9 @@ app = modal.App("coconut-download")
 
 image = modal.Image.debian_slim().pip_install(["modal"])
 
-# Use the same volume as the training scripts
+# Use the same volumes as the training scripts
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
+checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medium", create_if_missing=True)
 
 @app.function(
     image=image,
@@ -211,6 +212,80 @@ def list_available_checkpoints():
     except Exception as e:
         print(f"❌ Error listing Coconut checkpoints: {e}")
 
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=60 * 60 * 1
+)
+def list_checkpoints_in_path(path: str = "/checkpoints/gpt2medium-prontoqa-checkpoints"):
+    """List checkpoints found under an arbitrary path (default: gpt2-medium prontoqa path)."""
+    import os
+    print(f"🔍 Listing checkpoints in: {path}")
+    print("=" * 50)
+    try:
+        if not os.path.exists(path):
+            print("❌ Directory not found")
+            return False
+        entries = sorted(os.listdir(path))
+        # Show checkpoint_* directories or files
+        ckpts = [e for e in entries if e.startswith("checkpoint_")]
+        if ckpts:
+            print("📁 Checkpoints:")
+            for e in ckpts:
+                print(f"   - {e}")
+        else:
+            print("📁 Checkpoints: None found")
+        # Also list non-checkpoint entries for visibility
+        others = [e for e in entries if not e.startswith("checkpoint_")]
+        if others:
+            print()
+            print("📄 Other entries:")
+            for e in others[:20]:
+                print(f"   - {e}")
+            if len(others) > 20:
+                print(f"   ... and {len(others) - 20} more")
+        return True
+    except Exception as e:
+        print(f"❌ Error listing '{path}': {e}")
+        return False
+
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume_medium},
+    timeout=60 * 60 * 1
+)
+def list_checkpoints_in_path_medium(path: str = "/checkpoints/gpt2medium-prontoqa-checkpoints"):
+    """List checkpoints under path in the gpt2-medium volume."""
+    import os
+    print(f"🔍 Listing checkpoints (gpt2-medium volume) in: {path}")
+    print("=" * 50)
+    try:
+        if not os.path.exists(path):
+            print("❌ Directory not found")
+            return False
+        entries = sorted(os.listdir(path))
+        ckpts = [e for e in entries if e.startswith("checkpoint_")]
+        if ckpts:
+            print("📁 Checkpoints:")
+            for e in ckpts:
+                print(f"   - {e}")
+        else:
+            print("📁 Checkpoints: None found")
+        others = [e for e in entries if not e.startswith("checkpoint_")]
+        if others:
+            print()
+            print("📄 Other entries:")
+            for e in others[:20]:
+                print(f"   - {e}")
+            if len(others) > 20:
+                print(f"   ... and {len(others) - 20} more")
+        return True
+    except Exception as e:
+        print(f"❌ Error listing '{path}': {e}")
+        return False
+
 @app.function(
     image=image,
     volumes={"/checkpoints": checkpoint_volume},
@@ -354,6 +429,8 @@ def main():
     print()
     print("📋 List available checkpoints:")
     print("   modal run modal_download.py::list_available_checkpoints")
+    print("   modal run modal_download.py::list_checkpoints_in_path --path '/checkpoints/gpt2medium-prontoqa-checkpoints'")
+    print("   modal run modal_download.py::list_checkpoints_in_path_medium --path '/checkpoints/gpt2medium-prontoqa-checkpoints'")
     print()
     print("📥 Download specific checkpoints:")
     print("   modal run modal_download.py::download_cot_checkpoint --checkpoint-name 'checkpoint_25' --local-path './my_checkpoints'")

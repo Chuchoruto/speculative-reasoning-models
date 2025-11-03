@@ -187,7 +187,8 @@ def download_draft_training_data(
     local_path: str = "./downloaded_checkpoints",
     include_npz: bool = True,
     volume_name: str = "coconut-checkpoints",
-    max_workers: int = 10
+    max_workers: int = 10,
+    volume_path: str = "/checkpoints/draft_data"
 ):
     """
     Download draft training data from Modal volume using CLI.
@@ -199,7 +200,8 @@ def download_draft_training_data(
         volume_name: Name of the Modal volume
         max_workers: Number of parallel download workers (default: 10)
     """
-    volume_path = "/checkpoints/draft_data"
+    # Remote directory inside the volume to list/download from
+    volume_path = volume_path
     local_draft_path = os.path.join(local_path, "draft_data")
     os.makedirs(local_draft_path, exist_ok=True)
     
@@ -504,6 +506,12 @@ def main():
         help="Name of the Modal volume (default: coconut-checkpoints)"
     )
     parser.add_argument(
+        "--volume-path",
+        type=str,
+        default="/checkpoints/draft_data",
+        help="Path inside the volume to draft data (default: /checkpoints/draft_data)"
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=10,
@@ -530,7 +538,8 @@ def main():
         local_path=args.local_path,
         include_npz=args.include_npz,
         volume_name=args.volume_name,
-        max_workers=args.max_workers
+        max_workers=args.max_workers,
+        volume_path=args.volume_path
     )
     
     return 0 if success else 1

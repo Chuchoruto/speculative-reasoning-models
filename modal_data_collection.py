@@ -31,8 +31,10 @@ image = (
         .add_local_dir("args", "/workspace/args")
 )
 
-# Use the same persistent volume
+# Use the same persistent volume (gsm/gpt2 small)
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
+# Separate volume for gpt2-medium
+checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medium", create_if_missing=True)
 
 @app.function(
     image=image,
@@ -108,6 +110,70 @@ def collect_draft_training_data(
     
     # Commit the volume to persist changes
     checkpoint_volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu="A100:1",
+    timeout=60 * 60 * 6,
+    volumes={"/checkpoints": checkpoint_volume_medium},
+)
+def collect_prontoqa_medium(split: str = "train", max_samples: int = None):
+    """
+    Collect draft training data (latents, logits, tokens) for gpt2-medium ProntoQA Coconut.
+    - Uses checkpoint_25 from /checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium
+    - Saves JSON + NPZ to /checkpoints/gpt2medium-prontoqa-checkpoints/draft_data/
+    - split: 'train' or 'valid'
+    """
+    import subprocess
+    import os
+    import yaml
+    os.chdir("/workspace")
+
+    base_dir = "/checkpoints/gpt2medium-prontoqa-checkpoints"
+    ckpt_dir = f"{base_dir}/prontoqa-coconut-gpt2-medium"
+    checkpoint_path = f"{ckpt_dir}/checkpoint_25"
+    if not os.path.exists(ckpt_dir):
+        print(f"❌ Checkpoint directory not found: {ckpt_dir}")
+        return
+    if not os.path.exists(checkpoint_path):
+        print(f"❌ Checkpoint not found: {checkpoint_path}")
+        return
+
+    data_path = "data/prontoqa_train.json" if split == "train" else "data/prontoqa_valid.json"
+    out_dir = f"{base_dir}/draft_data"
+    os.makedirs(out_dir, exist_ok=True)
+    output_filename = f"prontoqa_{split}_draft_training_data.json"
+
+    print(f"Collecting draft data for split='{split}' from {checkpoint_path}")
+    print(f"Saving to: {out_dir}/{output_filename}")
+
+    # Create collection config
+    config = {
+        "project": "Speculative-Reasoning",
+        "save_path": "/checkpoints",
+        "model_id": "openai-community/gpt2-medium",
+        "load_model_path": checkpoint_path,
+        "c_thought": 1,
+        "max_latent_stage": 6,
+        "seed": 0,
+        "output_filename": f"{out_dir}/{output_filename}",
+        "max_samples": max_samples,
+        "data_path": data_path,
+    }
+
+    with open("draft_collection_config_medium.yaml", "w") as f:
+        yaml.dump(config, f)
+
+    print("Starting medium data collection with 1x A100 GPU...")
+    subprocess.run([
+        "torchrun", "--nnodes", "1", "--nproc_per_node", "1",
+        "collect_draft_training_data.py", "draft_collection_config_medium.yaml"
+    ], check=True)
+
+    print("✅ Medium draft data collection completed!")
+    print(f"Collected: {out_dir}/{output_filename}")
+    checkpoint_volume_medium.commit()
 
 
 @app.local_entrypoint()
