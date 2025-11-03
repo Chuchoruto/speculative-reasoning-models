@@ -102,10 +102,81 @@ def train_coconut(cot_checkpoint_path: str):
     # Commit the volume to persist changes
     checkpoint_volume.commit()
 
+@app.function(
+    image=image,
+    gpu="A100:4",
+    timeout=60 * 60 * 24,
+    volumes={"/checkpoints": checkpoint_volume},
+    secrets=[modal.Secret.from_name("wandb")],
+)
+def train_prontoqa_coconut(cot_checkpoint_path: str = None):
+    """
+    Train ProntoQA Coconut model using existing args/prontoqa_coconut.yaml config.
+    
+    Args:
+        cot_checkpoint_path: Optional CoT checkpoint path. If None, uses value from YAML (None means train from scratch).
+    """
+    import subprocess
+    import os
+    
+    os.chdir("/workspace")
+    
+    # Load existing prontoqa config
+    config_path = "args/prontoqa_coconut.yaml"
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    
+    # Update paths for Modal
+    config["save_path"] = "/checkpoints"  # Override save_path to use volume
+    if cot_checkpoint_path:
+        config["load_model_path"] = cot_checkpoint_path
+        print(f"Loading CoT checkpoint from: {cot_checkpoint_path}")
+    else:
+        print(f"Using load_model_path from config: {config.get('load_model_path', 'None')}")
+    
+    # Save updated config to workspace (temporary file)
+    modal_config_path = "prontoqa_coconut_modal.yaml"
+    with open(modal_config_path, "w") as f:
+        yaml.dump(config, f)
+    
+    print("Starting ProntoQA Coconut training with 4x A100 GPUs...")
+    print(f"Training config: {config_path}")
+    print(f"Max latent stages: {config.get('max_latent_stage', 'N/A')}")
+    print(f"C_thought: {config.get('c_thought', 'N/A')}")
+    print(f"Training stages: 0 through {config.get('max_latent_stage', 'N/A')}")
+    
+    subprocess.run([
+        "torchrun",
+        "--nnodes", "1",
+        "--nproc_per_node", "4",
+        "run.py",
+        modal_config_path
+    ], check=True)
+    
+    print("ProntoQA Coconut training completed!")
+    print("Checkpoints saved to: /checkpoints/prontoqa-coconut/")
+    print("Look for checkpoint with best validation accuracy")
+    
+    # Commit the volume to persist changes
+    checkpoint_volume.commit()
+
+
 @app.local_entrypoint()
 def main():
-    print("Starting GSM8K Coconut Training (Stage 1)...")
-    print("Make sure you have completed CoT training first!")
-    print("You need to specify the CoT checkpoint path.")
-    print("Example usage:")
-    print("modal run modal_coconut_training.py::train_coconut --cot-checkpoint-path '/checkpoints/gsm-cot/checkpoint_25'")
+    print("Coconut Training on Modal")
+    print("=" * 60)
+    print()
+    print("GSM8K Training:")
+    print("  modal run modal_coconut_training.py::train_coconut \\")
+    print("    --cot-checkpoint-path '/checkpoints/gsm-cot/checkpoint_25'")
+    print()
+    print("ProntoQA Training:")
+    print("  modal run modal_coconut_training.py::train_prontoqa_coconut")
+    print("    (or with CoT checkpoint:)")
+    print("  modal run modal_coconut_training.py::train_prontoqa_coconut \\")
+    print("    --cot-checkpoint-path '/checkpoints/prontoqa-cot/checkpoint_X'")
+    print()
+    print("Note: ProntoQA training uses args/prontoqa_coconut.yaml config")
