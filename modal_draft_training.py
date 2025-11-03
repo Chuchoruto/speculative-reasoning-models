@@ -31,8 +31,10 @@ image = (
     .add_local_file("draft_dataset.py", "/workspace/draft_dataset.py")
 )
 
-# Use the same persistent volume
+# Use the same persistent volume (gsm/small model)
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
+# Separate volume for gpt2-medium
+checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medium", create_if_missing=True)
 
 @app.function(
     image=image,
@@ -157,6 +159,138 @@ def train_draft_model(
     checkpoint_volume.commit()
 
 
+@app.function(
+    image=image,
+    gpu="A100:2",  # 2 GPUs for parallel training
+    timeout=60 * 60 * 24,  # 24 hours
+    volumes={"/checkpoints": checkpoint_volume_medium},
+    secrets=[modal.Secret.from_name("wandb")],
+)
+def train_draft_model_medium(
+    data_json_filename: str = "prontoqa_train_draft_training_data.json",
+    val_json_filename: str = "prontoqa_valid_draft_training_data.json",
+    batch_size: int = 32,
+    num_epochs: int = 40,
+    lr: float = 1e-3,
+    weight_decay: float = 0.01,
+    ce_weight: float = 2.0,
+    kl_weight: float = 1.0,
+    cosine_weight: float = 0.5,
+    temperature: float = 2.0,
+    gradient_accumulation_steps: int = 4,
+    warmup_steps: int = 500,
+    wandb_project: str = "draft-model-training-prontoqa-medium",
+    wandb_run_name: str = None,
+):
+    """
+    Train draft model using gpt2-medium ProntoQA Coconut data from Modal volume.
+    Uses checkpoint_25 from gpt2medium-prontoqa-checkpoints.
+    Saves checkpoints to /checkpoints/gpt2medium-prontoqa-checkpoints/draft_checkpoints/
+    
+    Args:
+        data_json_filename: Name of JSON metadata file in /checkpoints/gpt2medium-prontoqa-checkpoints/draft_data/
+        val_json_filename: Name of validation JSON metadata file
+        batch_size: Training batch size per GPU (effective batch size = batch_size * 2)
+        num_epochs: Number of training epochs
+        lr: Learning rate (default: 1e-3)
+        weight_decay: Weight decay for optimizer (L2 regularization)
+        ce_weight: Weight for causal LM (CrossEntropy) loss
+        kl_weight: Weight for KL divergence loss
+        cosine_weight: Weight for cosine similarity loss (latent thoughts) (default: 0.5, reduced from 1.0)
+        temperature: Temperature for softmax in KL divergence (default: 2.0)
+        gradient_accumulation_steps: Number of batches to accumulate gradients before updating (default: 4)
+        warmup_steps: Number of warmup steps for learning rate (default: 500)
+        wandb_project: WandB project name
+        wandb_run_name: WandB run name (auto-generated if None)
+    """
+    import subprocess
+    import datetime
+    
+    os.chdir("/workspace")
+    
+    # Base directory in gpt2-medium volume
+    base_dir = "/checkpoints/gpt2medium-prontoqa-checkpoints"
+    draft_data_dir = f"{base_dir}/draft_data"
+    
+    # Paths in Modal volume
+    data_json_path = f"{draft_data_dir}/{data_json_filename}"
+    val_json_path = f"{draft_data_dir}/{val_json_filename}"
+    save_path = f"{base_dir}/draft_checkpoints"
+    
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Verify training data exists
+    if not os.path.exists(data_json_path):
+        available_files = os.listdir(draft_data_dir) if os.path.exists(draft_data_dir) else []
+        raise FileNotFoundError(
+            f"Training data file not found: {data_json_path}\n"
+            f"Available files in {draft_data_dir}: {available_files[:20]}"
+        )
+    
+    print(f"Loading training data from: {data_json_path}")
+    print(f"NPZ files directory: {draft_data_dir}")
+    
+    # Verify validation data
+    if not os.path.exists(val_json_path):
+        print(f"Warning: Validation data file not found: {val_json_path}")
+        print("Continuing without validation...")
+        val_json_path = None
+    else:
+        print(f"Validation data will be loaded from: {val_json_path}")
+    
+    # Generate run name if not provided
+    if wandb_run_name is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        wandb_run_name = f"draft_model_medium_{timestamp}"
+    
+    # Create config
+    config = {
+        "model_id": "erwanf/gpt2-mini",  # Draft model is still small
+        "teacher_hidden_dim": 1024,  # gpt2-medium has 1024 hidden dim
+        "data_json_path": data_json_path,
+        "data_dir": draft_data_dir,
+        "val_json_path": val_json_path,
+        "val_data_dir": draft_data_dir,
+        "save_path": save_path,
+        "batch_size": batch_size,
+        "num_epochs": num_epochs,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "num_workers": 4,
+        "ce_weight": ce_weight,
+        "kl_weight": kl_weight,
+        "cosine_weight": cosine_weight,
+        "temperature": temperature,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "warmup_steps": warmup_steps,
+        "use_wandb": True,
+        "wandb_project": wandb_project,
+        "wandb_run_name": wandb_run_name,
+    }
+    
+    config_path = "draft_training_config_medium.yaml"
+    with open(config_path, "w") as f:
+        yaml.dump(config, f)
+    
+    print("Starting draft model training (gpt2-medium ProntoQA) with 2x A100 GPUs...")
+    print(f"Config: {config}")
+    
+    # Run training with torchrun for distributed training
+    subprocess.run([
+        "torchrun",
+        "--nnodes", "1",
+        "--nproc_per_node", "2",
+        "train_draft_model.py",
+        config_path
+    ], check=True)
+    
+    print("Draft model training completed!")
+    print(f"Checkpoints saved to: {save_path}")
+    
+    # Commit volume to persist checkpoints
+    checkpoint_volume_medium.commit()
+
+
 @app.local_entrypoint()
 def main():
     print("Draft Model Training on Modal")
@@ -193,4 +327,39 @@ def main():
     print()
     print("Note: Training uses 2 GPUs with torchrun for distributed training.")
     print("      Batch size is per GPU, so effective batch size = batch_size * 2")
+    print()
+    print("=" * 60)
+    print("GPT2-MEDIUM PRONTOQA TRAINING:")
+    print("=" * 60)
+    print("Usage:")
+    print("  modal run modal_draft_training.py::train_draft_model_medium \\")
+    print("    --data-json-filename 'prontoqa_train_draft_training_data.json' \\")
+    print("    --val-json-filename 'prontoqa_valid_draft_training_data.json' \\")
+    print("    --batch-size 32 \\")
+    print("    --num-epochs 20 \\")
+    print("    --lr 0.001 \\")
+    print("    --weight-decay 0.01 \\")
+    print("    --ce-weight 1.0 \\")
+    print("    --kl-weight 1.0 \\")
+    print("    --cosine-weight 1.0 \\")
+    print("    --temperature 3.0 \\")
+    print("    --wandb-project 'draft-model-training-prontoqa-medium'")
+    print()
+    print("Default parameters:")
+    print("  - data_json_filename: 'prontoqa_train_draft_training_data.json'")
+    print("  - val_json_filename: 'prontoqa_valid_draft_training_data.json'")
+    print("  - batch_size: 32 (per GPU, effective: 64 with 2 GPUs)")
+    print("  - num_epochs: 10")
+    print("  - lr: 1e-3 (recommended)")
+    print("  - weight_decay: 0.01")
+    print("  - ce_weight: 2.0 (causal LM loss weight)")
+    print("  - kl_weight: 1.0 (KL divergence loss weight)")
+    print("  - cosine_weight: 0.5 (cosine similarity loss weight for latent thoughts, reduced)")
+    print("  - temperature: 2.0 (for KL divergence)")
+    print("  - gradient_accumulation_steps: 4 (accumulate gradients over 4 batches before updating)")
+    print("  - warmup_steps: 500 (linear warmup for learning rate)")
+    print("  - wandb_project: 'draft-model-training-prontoqa-medium'")
+    print()
+    print("Note: Checkpoints saved to /checkpoints/gpt2medium-prontoqa-checkpoints/draft_checkpoints/")
+    print("Note: Validation runs after each epoch and logs metrics to WandB.")
 

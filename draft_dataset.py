@@ -191,8 +191,11 @@ class DraftCollator:
         latent_thoughts_list = [item['latent_thoughts'] for item in batch]
         # Use updated latent positions (accounting for left padding)
         latent_positions_list = updated_latent_positions_batch
-        target_positions_list = [item['target_positions'] for item in batch]
-        # Note: target_positions might also need adjustment, but they're relative to the output sequence
+        # Adjust target_positions by the same left padding so indices line up with padded tensors
+        target_positions_list = [
+            [pos + left_paddings[idx] for pos in item['target_positions']]
+            for idx, item in enumerate(batch)
+        ]
         
         return {
             'input_ids': input_ids_batch,

@@ -209,8 +209,10 @@ def train_epoch(
     global_step=0,
     rank=0,
     world_size=1,
+    gradient_accumulation_steps=1,
+    warmup_scheduler=None,
 ):
-    """Train for one epoch."""
+    """Train for one epoch with gradient accumulation."""
     model.train()
     total_loss = 0.0
     total_ce = 0.0
@@ -220,6 +222,11 @@ def train_epoch(
     
     # Only show progress bar on rank 0
     pbar = tqdm(dataloader, desc="Training", disable=(rank != 0))
+    
+    # Initialize gradients at the start of the epoch
+    optimizer.zero_grad()
+    
+    # We'll accumulate gradients and update periodically
     for batch_idx, batch in enumerate(pbar):
         # Move to device
         input_ids = batch['input_ids'].to(device)
@@ -269,44 +276,85 @@ def train_epoch(
         
         loss = loss_dict['total_loss']
         
-        # Backward pass
-        optimizer.zero_grad()
+        # Scale loss by accumulation steps (to average over accumulated batches)
+        loss = loss / gradient_accumulation_steps
+        
+        # Backward pass (accumulate gradients)
         loss.backward()
         
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        
-        # Update metrics
-        total_loss += loss.item()
+        # Update metrics (use unscaled loss for logging)
+        unscaled_loss = loss.item() * gradient_accumulation_steps
+        total_loss += unscaled_loss
         total_ce += loss_dict['ce_loss'].item()
         total_kl += loss_dict['kl_loss'].item()
         total_cosine += loss_dict['cosine_loss'].item()
         num_batches += 1
-        global_step += 1
         
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': loss.item(),
-            'ce': loss_dict['ce_loss'].item(),
-            'kl': loss_dict['kl_loss'].item(),
-            'cos': loss_dict['cosine_loss'].item(),
-        })
-        
-        # Log to wandb
-        if wandb_run is not None and batch_idx % 10 == 0:  # Log every 10 batches
-            wandb_run.log({
-                'train/loss': loss.item(),
-                'train/ce_loss': loss_dict['ce_loss'].item(),
-                'train/kl_loss': loss_dict['kl_loss'].item(),
-                'train/cosine_loss': loss_dict['cosine_loss'].item(),
-                'train/num_ce_samples': loss_dict['num_ce_samples'],
-                'train/num_kl_samples': loss_dict['num_kl_samples'],
-                'train/num_cosine_samples': loss_dict['num_cosine_samples'],
-                'train/learning_rate': optimizer.param_groups[0]['lr'],
-                'train/step': global_step,
+        # Update weights every gradient_accumulation_steps batches
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+            
+            # Update weights
+            optimizer.step()
+            
+            # Update warmup scheduler after optimizer step
+            if warmup_scheduler is not None:
+                warmup_scheduler.step()
+            
+            # Zero gradients after update (not before each batch)
+            optimizer.zero_grad()
+            
+            global_step += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': unscaled_loss,
+                'ce': loss_dict['ce_loss'].item(),
+                'kl': loss_dict['kl_loss'].item(),
+                'cos': loss_dict['cosine_loss'].item(),
+                'step': global_step,
             })
+            
+            # Log to wandb
+            if wandb_run is not None:
+                wandb_run.log({
+                    'train/loss': unscaled_loss,
+                    'train/ce_loss': loss_dict['ce_loss'].item(),
+                    'train/kl_loss': loss_dict['kl_loss'].item(),
+                    'train/cosine_loss': loss_dict['cosine_loss'].item(),
+                    'train/num_ce_samples': loss_dict['num_ce_samples'],
+                    'train/num_kl_samples': loss_dict['num_kl_samples'],
+                    'train/num_cosine_samples': loss_dict['num_cosine_samples'],
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'train/step': global_step,
+                })
+        else:
+            # Just update progress bar without logging to wandb
+            pbar.set_postfix({
+                'loss': unscaled_loss,
+                'ce': loss_dict['ce_loss'].item(),
+                'kl': loss_dict['kl_loss'].item(),
+                'cos': loss_dict['cosine_loss'].item(),
+                'acc': f'{(batch_idx + 1) % gradient_accumulation_steps}/{gradient_accumulation_steps}',
+            })
+    
+    # Handle remaining gradients if num_batches is not divisible by gradient_accumulation_steps
+    if num_batches % gradient_accumulation_steps != 0:
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # Update weights
+        optimizer.step()
+        
+        # Update warmup scheduler after optimizer step
+        if warmup_scheduler is not None:
+            warmup_scheduler.step()
+        
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        global_step += 1
     
     return {
         'avg_loss': total_loss / num_batches,
@@ -320,6 +368,7 @@ def validate_epoch(
     model,
     dataloader,
     device,
+    tokenizer,
     ce_weight=1.0,
     kl_weight=1.0,
     cosine_weight=1.0,
@@ -327,14 +376,23 @@ def validate_epoch(
     wandb_run=None,
     rank=0,
     world_size=1,
+    num_samples_to_show=3,
 ):
-    """Validate for one epoch (no gradient updates)."""
+    """Validate for one epoch (no gradient updates) with exact match accuracy."""
     model.eval()
     total_loss = 0.0
     total_ce = 0.0
     total_kl = 0.0
     total_cosine = 0.0
     num_batches = 0
+    
+    # For exact match accuracy
+    exact_matches = 0
+    total_token_predictions = 0
+    
+    # Sample outputs for display
+    sample_outputs = []
+    samples_collected = 0
     
     with torch.no_grad():
         # Only show progress bar on rank 0
@@ -388,19 +446,96 @@ def validate_epoch(
             total_cosine += loss_dict['cosine_loss'].item()
             num_batches += 1
             
+            # Compute exact match accuracy
+            batch_size = input_ids.shape[0]
+            for sample_idx in range(batch_size):
+                target_tokens_sample = target_tokens[sample_idx]  # [num_target_tokens]
+                target_positions_sample = batch['target_positions'][sample_idx]  # List of positions
+                
+                # Get predicted tokens from student logits at target positions
+                predicted_tokens = []
+                for i, pos in enumerate(target_positions_sample):
+                    if pos > 0 and pos - 1 < outputs.logits.shape[1]:
+                        logit_pos = pos - 1
+                        logits_at_pos = outputs.logits[sample_idx, logit_pos, :]  # [vocab_size]
+                        predicted_token = torch.argmax(logits_at_pos, dim=-1).item()
+                        predicted_tokens.append(predicted_token)
+                
+                # Compare predicted vs target tokens
+                min_len = min(len(predicted_tokens), len(target_tokens_sample))
+                if min_len > 0:
+                    predicted_tokens_aligned = predicted_tokens[:min_len]
+                    target_tokens_aligned = target_tokens_sample[:min_len].cpu().tolist()
+                    
+                    # Exact match: all tokens must match
+                    is_exact_match = predicted_tokens_aligned == target_tokens_aligned
+                    if is_exact_match:
+                        exact_matches += 1
+                    
+                    total_token_predictions += 1
+                    
+                    # Collect sample outputs for display
+                    if samples_collected < num_samples_to_show and rank == 0:
+                        # Get input text (remove padding and special tokens for readability)
+                        input_sample = input_ids[sample_idx].cpu().tolist()
+                        # Remove padding
+                        input_sample = [t for t in input_sample if t != tokenizer.pad_token_id]
+                        
+                        try:
+                            input_text = tokenizer.decode(input_sample, skip_special_tokens=False)
+                            predicted_text = tokenizer.decode(predicted_tokens_aligned, skip_special_tokens=False)
+                            target_text = tokenizer.decode(target_tokens_aligned, skip_special_tokens=False)
+                            
+                            sample_outputs.append({
+                                'sample_idx': samples_collected,
+                                'input': input_text[:200] + "..." if len(input_text) > 200 else input_text,
+                                'predicted_tokens': predicted_tokens_aligned,
+                                'predicted_text': predicted_text,
+                                'target_tokens': target_tokens_aligned,
+                                'target_text': target_text,
+                                'exact_match': is_exact_match,
+                            })
+                            samples_collected += 1
+                        except Exception as e:
+                            # Skip if decoding fails
+                            pass
+            
             # Update progress bar
+            current_accuracy = exact_matches / total_token_predictions if total_token_predictions > 0 else 0.0
             pbar.set_postfix({
                 'loss': loss.item(),
                 'ce': loss_dict['ce_loss'].item(),
                 'kl': loss_dict['kl_loss'].item(),
                 'cos': loss_dict['cosine_loss'].item(),
+                'acc': f'{current_accuracy:.2%}',
             })
+    
+    # Calculate final accuracy
+    exact_match_accuracy = exact_matches / total_token_predictions if total_token_predictions > 0 else 0.0
+    
+    # Print sample outputs on rank 0
+    if rank == 0 and len(sample_outputs) > 0:
+        print("\n" + "="*80)
+        print("VALIDATION SAMPLE OUTPUTS")
+        print("="*80)
+        for sample in sample_outputs:
+            print(f"\nSample {sample['sample_idx'] + 1}:")
+            print(f"  Input (first 200 chars): {sample['input']}")
+            print(f"  Target tokens: {sample['target_tokens'][:20]}..." if len(sample['target_tokens']) > 20 else f"  Target tokens: {sample['target_tokens']}")
+            print(f"  Predicted tokens: {sample['predicted_tokens'][:20]}..." if len(sample['predicted_tokens']) > 20 else f"  Predicted tokens: {sample['predicted_tokens']}")
+            print(f"  Target text: {sample['target_text'][:100]}..." if len(sample['target_text']) > 100 else f"  Target text: {sample['target_text']}")
+            print(f"  Predicted text: {sample['predicted_text'][:100]}..." if len(sample['predicted_text']) > 100 else f"  Predicted text: {sample['predicted_text']}")
+            print(f"  Exact Match: {'✓' if sample['exact_match'] else '✗'}")
+        print("="*80 + "\n")
     
     return {
         'avg_loss': total_loss / num_batches,
         'avg_ce': total_ce / num_batches,
         'avg_kl': total_kl / num_batches,
         'avg_cosine': total_cosine / num_batches,
+        'exact_match_accuracy': exact_match_accuracy,
+        'exact_matches': exact_matches,
+        'total_predictions': total_token_predictions,
     }
 
 
@@ -548,30 +683,41 @@ def main():
         )
     
     # Setup optimizer
+    initial_lr = config.get('lr', 1e-4)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=config.get('lr', 1e-4),
+        lr=initial_lr,
         weight_decay=config.get('weight_decay', 0.01),
     )
     
     # Training loop
     num_epochs = config.get('num_epochs', 10)
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+    warmup_steps = config.get('warmup_steps', 0)
     
     # Setup learning rate schedulers
-    # Base scheduler: Exponential decay (decays every epoch by a fixed factor)
-    from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
+    # 1. Warmup scheduler: Linear warmup from 0 to initial_lr over warmup_steps
+    from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau, LambdaLR
     
-    initial_lr = config.get('lr', 1e-4)
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            # Linear warmup: step / warmup_steps
+            return step / warmup_steps
+        else:
+            # After warmup, use exponential decay
+            return 1.0
+    
+    # Base scheduler: exponential decay (decays every epoch)
     # Calculate decay factor to reach ~10% of initial LR by end of training
     # gamma^num_epochs = 0.1 => gamma = 0.1^(1/num_epochs)
     gamma = 0.1 ** (1.0 / num_epochs)
-    
-    # Base scheduler: exponential decay (decays every epoch)
     scheduler = ExponentialLR(optimizer, gamma=gamma)
     
-    # Additional scheduler: Reduce on plateau for KL loss
-    # This will provide additional LR reduction when KL loss plateaus
-    # Threshold: requires at least 3% relative improvement to count as progress
+    # Warmup scheduler (applied per step, not per epoch)
+    warmup_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    
+    # Additional scheduler: Reduce on plateau for CE loss
+    # This will provide additional LR reduction when CE loss plateaus
     plateau_scheduler = ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -582,6 +728,7 @@ def main():
         threshold=0.03,  # Require at least 3% relative improvement to count as progress
         threshold_mode='rel',  # Relative threshold mode
     )
+    
     ce_weight = config.get('ce_weight', 1.0)
     kl_weight = config.get('kl_weight', 1.0)
     cosine_weight = config.get('cosine_weight', 1.0)
@@ -590,6 +737,9 @@ def main():
     if rank == 0:
         print(f"\nStarting training for {num_epochs} epochs...")
         print(f"Loss weights: CE={ce_weight}, KL={kl_weight}, Cosine={cosine_weight}")
+        print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+        print(f"Warmup steps: {warmup_steps}")
+        print(f"Initial learning rate: {initial_lr}")
     
     global_step = 0
     for epoch in range(num_epochs):
@@ -614,6 +764,8 @@ def main():
             global_step=global_step,
             rank=rank,
             world_size=world_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            warmup_scheduler=warmup_scheduler,
         )
         
         if rank == 0:
@@ -629,6 +781,7 @@ def main():
                 model,
                 val_dataloader,
                 device,
+                tokenizer,
                 ce_weight=ce_weight,
                 kl_weight=kl_weight,
                 cosine_weight=cosine_weight,
@@ -636,11 +789,14 @@ def main():
                 wandb_run=wandb_run,
                 rank=rank,
                 world_size=world_size,
+                num_samples_to_show=3,
             )
             
             if rank == 0:
                 print(f"Epoch {epoch + 1} - Val Loss: {val_metrics['avg_loss']:.4f}, "
                       f"CE: {val_metrics['avg_ce']:.4f}, KL: {val_metrics['avg_kl']:.4f}, Cosine: {val_metrics['avg_cosine']:.4f}")
+                print(f"Epoch {epoch + 1} - Val Exact Match Accuracy: {val_metrics['exact_match_accuracy']:.2%} "
+                      f"({val_metrics['exact_matches']}/{val_metrics['total_predictions']})")
         
         # Log epoch metrics to wandb (only on rank 0)
         if wandb_run is not None:
@@ -657,6 +813,7 @@ def main():
                     'epoch/val_ce_loss': val_metrics['avg_ce'],
                     'epoch/val_kl_loss': val_metrics['avg_kl'],
                     'epoch/val_cosine_loss': val_metrics['avg_cosine'],
+                    'epoch/val_exact_match_accuracy': val_metrics['exact_match_accuracy'],
                 })
             wandb_run.log(log_dict)
         
@@ -675,6 +832,7 @@ def main():
             current_lr = optimizer.param_groups[0]['lr']
             if wandb_run is not None:
                 wandb_run.log({'train/learning_rate': current_lr})
+        
         
         # Save checkpoint (only on rank 0)
         if config.get('save_path') and rank == 0:
