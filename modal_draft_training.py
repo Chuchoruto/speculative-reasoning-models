@@ -24,7 +24,7 @@ image = (
     ])
     .env({
         "NCCL_DEBUG": "INFO",
-        "CUDA_VISIBLE_DEVICES": "0,1"
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3"
     })
     .add_local_file("train_draft_model.py", "/workspace/train_draft_model.py")
     .add_local_file("draft_model.py", "/workspace/draft_model.py")
@@ -38,7 +38,7 @@ checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medi
 
 @app.function(
     image=image,
-    gpu="A100:2",  # 2 GPUs for parallel training
+    gpu="A100:4",  # 4 GPUs for parallel training
     timeout=60 * 60 * 24,  # 24 hours
     volumes={"/checkpoints": checkpoint_volume},
     secrets=[modal.Secret.from_name("wandb")],  # WandB secret
@@ -140,14 +140,14 @@ def train_draft_model(
     with open(config_path, "w") as f:
         yaml.dump(config, f)
     
-    print("Starting draft model training with 2x A100 GPUs...")
+    print("Starting draft model training with 4x A100 GPUs...")
     print(f"Config: {config}")
     
     # Run training with torchrun for distributed training
     subprocess.run([
         "torchrun",
         "--nnodes", "1",
-        "--nproc_per_node", "2",
+        "--nproc_per_node", "4",
         "train_draft_model.py",
         config_path
     ], check=True)
@@ -161,7 +161,7 @@ def train_draft_model(
 
 @app.function(
     image=image,
-    gpu="A100:2",  # 2 GPUs for parallel training
+    gpu="A100:4",  # 4 GPUs for parallel training
     timeout=60 * 60 * 24,  # 24 hours
     volumes={"/checkpoints": checkpoint_volume_medium},
     secrets=[modal.Secret.from_name("wandb")],
@@ -178,7 +178,7 @@ def train_draft_model_medium(
     cosine_weight: float = 0.5,
     temperature: float = 2.0,
     gradient_accumulation_steps: int = 4,
-    warmup_steps: int = 500,
+    warmup_steps: int = 20,
     wandb_project: str = "draft-model-training-prontoqa-medium",
     wandb_run_name: str = None,
 ):
@@ -199,7 +199,7 @@ def train_draft_model_medium(
         cosine_weight: Weight for cosine similarity loss (latent thoughts) (default: 0.5, reduced from 1.0)
         temperature: Temperature for softmax in KL divergence (default: 2.0)
         gradient_accumulation_steps: Number of batches to accumulate gradients before updating (default: 4)
-        warmup_steps: Number of warmup steps for learning rate (default: 500)
+        warmup_steps: Number of warmup steps for learning rate (default: 20)
         wandb_project: WandB project name
         wandb_run_name: WandB run name (auto-generated if None)
     """
@@ -256,6 +256,7 @@ def train_draft_model_medium(
         "num_epochs": num_epochs,
         "lr": lr,
         "weight_decay": weight_decay,
+        "peak_lr": 4e-4,
         "num_workers": 4,
         "ce_weight": ce_weight,
         "kl_weight": kl_weight,
@@ -272,14 +273,14 @@ def train_draft_model_medium(
     with open(config_path, "w") as f:
         yaml.dump(config, f)
     
-    print("Starting draft model training (gpt2-medium ProntoQA) with 2x A100 GPUs...")
+    print("Starting draft model training (gpt2-medium ProntoQA) with 4x A100 GPUs...")
     print(f"Config: {config}")
     
     # Run training with torchrun for distributed training
     subprocess.run([
         "torchrun",
         "--nnodes", "1",
-        "--nproc_per_node", "2",
+        "--nproc_per_node", "4",
         "train_draft_model.py",
         config_path
     ], check=True)
@@ -357,7 +358,7 @@ def main():
     print("  - cosine_weight: 0.5 (cosine similarity loss weight for latent thoughts, reduced)")
     print("  - temperature: 2.0 (for KL divergence)")
     print("  - gradient_accumulation_steps: 4 (accumulate gradients over 4 batches before updating)")
-    print("  - warmup_steps: 500 (linear warmup for learning rate)")
+    print("  - warmup_steps: 20 (linear warmup for learning rate, then exponential decay per step)")
     print("  - wandb_project: 'draft-model-training-prontoqa-medium'")
     print()
     print("Note: Checkpoints saved to /checkpoints/gpt2medium-prontoqa-checkpoints/draft_checkpoints/")

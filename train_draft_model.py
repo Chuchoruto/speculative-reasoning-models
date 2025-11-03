@@ -210,10 +210,21 @@ def train_epoch(
     rank=0,
     world_size=1,
     gradient_accumulation_steps=1,
-    warmup_scheduler=None,
+    lr_scheduler=None,
+    current_epoch=0,
 ):
     """Train for one epoch with gradient accumulation."""
     model.train()
+    
+    # Use gradient accumulation only after epoch 4 (0-indexed: epochs 5+)
+    # Before epoch 4, use gradient_accumulation_steps=1 for richer updates
+    if current_epoch < 4:
+        effective_grad_accum_steps = 1
+    else:
+        effective_grad_accum_steps = gradient_accumulation_steps
+    
+    if rank == 0 and current_epoch == 4:
+        print(f"Switching to gradient accumulation (steps={effective_grad_accum_steps}) starting from epoch 5")
     total_loss = 0.0
     total_ce = 0.0
     total_kl = 0.0
@@ -277,30 +288,30 @@ def train_epoch(
         loss = loss_dict['total_loss']
         
         # Scale loss by accumulation steps (to average over accumulated batches)
-        loss = loss / gradient_accumulation_steps
+        loss = loss / effective_grad_accum_steps
         
         # Backward pass (accumulate gradients)
         loss.backward()
         
         # Update metrics (use unscaled loss for logging)
-        unscaled_loss = loss.item() * gradient_accumulation_steps
+        unscaled_loss = loss.item() * effective_grad_accum_steps
         total_loss += unscaled_loss
         total_ce += loss_dict['ce_loss'].item()
         total_kl += loss_dict['kl_loss'].item()
         total_cosine += loss_dict['cosine_loss'].item()
         num_batches += 1
         
-        # Update weights every gradient_accumulation_steps batches
-        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+        # Update weights every effective_grad_accum_steps batches
+        if (batch_idx + 1) % effective_grad_accum_steps == 0:
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             # Update weights
             optimizer.step()
             
-            # Update warmup scheduler after optimizer step
-            if warmup_scheduler is not None:
-                warmup_scheduler.step()
+            # Update learning rate scheduler after optimizer step (per step, not per epoch)
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             
             # Zero gradients after update (not before each batch)
             optimizer.zero_grad()
@@ -336,20 +347,20 @@ def train_epoch(
                 'ce': loss_dict['ce_loss'].item(),
                 'kl': loss_dict['kl_loss'].item(),
                 'cos': loss_dict['cosine_loss'].item(),
-                'acc': f'{(batch_idx + 1) % gradient_accumulation_steps}/{gradient_accumulation_steps}',
+                'acc': f'{(batch_idx + 1) % effective_grad_accum_steps}/{effective_grad_accum_steps}',
             })
     
-    # Handle remaining gradients if num_batches is not divisible by gradient_accumulation_steps
-    if num_batches % gradient_accumulation_steps != 0:
+    # Handle remaining gradients if num_batches is not divisible by effective_grad_accum_steps
+    if num_batches % effective_grad_accum_steps != 0:
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         # Update weights
         optimizer.step()
         
-        # Update warmup scheduler after optimizer step
-        if warmup_scheduler is not None:
-            warmup_scheduler.step()
+        # Update learning rate scheduler after optimizer step
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         
         # Zero gradients
         optimizer.zero_grad()
@@ -693,31 +704,34 @@ def main():
     # Training loop
     num_epochs = config.get('num_epochs', 10)
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
-    warmup_steps = config.get('warmup_steps', 0)
+    warmup_steps = config.get('warmup_steps', 20)  # Default to 20 steps
+    peak_lr = config.get('peak_lr', 4e-4)  # Cap LR after warmup
     
     # Setup learning rate schedulers
-    # 1. Warmup scheduler: Linear warmup from 0 to initial_lr over warmup_steps
-    from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau, LambdaLR
+    # Combined scheduler: Linear warmup + exponential decay per step
+    from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
+    
+    # Exponential decay factor per step
+    # Tie gamma to weight_decay argument: gamma = 1 - weight_decay
+    # e.g., weight_decay=0.02 -> gamma=0.98 per step
+    wd_value = config.get('weight_decay', 0.01)
+    decay_gamma_per_step = max(0.0, min(1.0, 1.0 - wd_value))
     
     def lr_lambda(step):
+        # Scale so warmup tops at peak_lr (not initial_lr)
+        peak_scale = (peak_lr / initial_lr) if initial_lr > 0 else 1.0
         if warmup_steps > 0 and step < warmup_steps:
-            # Linear warmup: step / warmup_steps
-            return step / warmup_steps
+            # Linear warmup to peak_lr
+            return (step / warmup_steps) * peak_scale
         else:
-            # After warmup, use exponential decay
-            return 1.0
+            # After warmup: exponential decay per step from peak
+            steps_after_warmup = max(0, step - warmup_steps)
+            return peak_scale * (decay_gamma_per_step ** steps_after_warmup)
     
-    # Base scheduler: exponential decay (decays every epoch)
-    # Calculate decay factor to reach ~10% of initial LR by end of training
-    # gamma^num_epochs = 0.1 => gamma = 0.1^(1/num_epochs)
-    gamma = 0.1 ** (1.0 / num_epochs)
-    scheduler = ExponentialLR(optimizer, gamma=gamma)
+    # Combined warmup + exponential decay scheduler (applied per step)
+    lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     
-    # Warmup scheduler (applied per step, not per epoch)
-    warmup_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-    
-    # Additional scheduler: Reduce on plateau for CE loss
-    # This will provide additional LR reduction when CE loss plateaus
+    # Additional scheduler: Reduce on plateau for CE loss (optional, for extra safety)
     plateau_scheduler = ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -739,6 +753,8 @@ def main():
         print(f"Loss weights: CE={ce_weight}, KL={kl_weight}, Cosine={cosine_weight}")
         print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
         print(f"Warmup steps: {warmup_steps}")
+        print(f"Warmup peak LR: {peak_lr}")
+        print(f"Exponential decay per step (gamma = 1 - weight_decay): gamma={decay_gamma_per_step} ({(1-decay_gamma_per_step)*100:.1f}% reduction per step)")
         print(f"Initial learning rate: {initial_lr}")
     
     global_step = 0
@@ -765,7 +781,8 @@ def main():
             rank=rank,
             world_size=world_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_scheduler=warmup_scheduler,
+            lr_scheduler=lr_scheduler,
+            current_epoch=epoch,
         )
         
         if rank == 0:
@@ -820,12 +837,11 @@ def main():
         # Update learning rate schedulers
         # Only on rank 0 to avoid multiple print statements
         if rank == 0:
-            # Step exponential decay scheduler (decays every epoch)
-            scheduler.step()
+            # Note: lr_scheduler is already stepped per update in train_epoch
+            # Here we only step the plateau scheduler (per epoch)
             
-            # Also check plateau scheduler for additional reduction when CE loss plateaus
+            # Check plateau scheduler for additional reduction when CE loss plateaus
             # Use validation CE loss if available, otherwise training CE loss
-            # (CE loss is more critical for sequence coherence)
             ce_loss_for_scheduler = val_metrics['avg_ce'] if val_metrics is not None else train_metrics['avg_ce']
             plateau_scheduler.step(ce_loss_for_scheduler)
             
