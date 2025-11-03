@@ -35,74 +35,39 @@ image = (
 
 # Use the same persistent volume
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
+# Separate volume for gpt2-medium
+checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medium", create_if_missing=True)
 
 
-@app.function(
-    image=image,
-    gpu="A100:1",
-    timeout=60 * 60 * 4,  # 4 hours
-    volumes={"/checkpoints": checkpoint_volume},
-)
-def evaluate_speculative_decoding(
+def _evaluate_speculative_decoding_impl(
     draft_checkpoint_path: str,
     target_checkpoint_path: str,
-    data_path: str = "data/gsm_test.json",
-    num_latent_thoughts: int = 6,
-    gamma: int = 6,
-    max_new_tokens: int = 50,
-    similarity_threshold: float = 0.9,
-    max_samples: int = 100,
-    clock_run: str = "False",
-    record_output: str = "False",
-    baseline_only: str = "False",
-    tokens_speculative: str = "False",
-    skip_latent_verification: str = "False",
+    data_path: str,
+    num_latent_thoughts: int,
+    gamma: int,
+    max_new_tokens: int,
+    similarity_threshold: float,
+    max_samples: int,
+    clock_run_bool: bool,
+    record_output_bool: bool,
+    baseline_only_bool: bool,
+    tokens_speculative_bool: bool,
+    skip_latent_verification_bool: bool,
+    target_model_id: str,
+    target_hidden_dim: int,
+    use_medium_volume_bool: bool,
 ):
     """
-    Evaluate speculative decoding with draft and target models.
-    
-    Args:
-        draft_checkpoint_path: Path to draft model checkpoint in Modal volume
-        target_checkpoint_path: Path to target (Coconut) model checkpoint
-        data_path: Path to test data JSON file
-        num_latent_thoughts: Number of latent thoughts to generate (default 6)
-        gamma: Number of draft tokens per round (default 4)
-        max_new_tokens: Maximum new tokens to generate (default 50)
-        similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
-        max_samples: Maximum number of samples to evaluate (default 100)
-        clock_run: Enable wallclock timing. Accepts "True", "true", "1", "False", "false", "0" (default "False")
-        record_output: Record generated outputs for comparison. Requires clock_run=True. Accepts "True", "true", "1", etc. (default "False")
-        baseline_only: Only run baseline (target model) decoding, skip speculative decoding. Accepts "True", "true", "1", etc. (default "False")
-        tokens_speculative: If True, use speculative decoding for tokens. If False, use autoregressive generation with target model only after latent thoughts. Accepts "True", "true", "1", etc. (default "False")
-        skip_latent_verification: If True, skip target model verification of latent thoughts (use draft only). Much faster. Accepts "True", "true", "1", etc. (default "False")
+    Core implementation of speculative decoding evaluation.
+    This is a regular function (not a Modal function) that can be called by Modal functions.
     """
     import json
     import sys
     import numpy as np
     import os
+    import torch
     from tqdm import tqdm
     
-    # Parse string parameters to boolean
-    clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
-    record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
-    baseline_only_bool = baseline_only.lower() in ("true", "1", "yes", "on")
-    tokens_speculative_bool = tokens_speculative.lower() in ("true", "1", "yes", "on")
-    skip_latent_verification_bool = skip_latent_verification.lower() in ("true", "1", "yes", "on")
-    
-    # If baseline_only is True, clock_run must also be True
-    if baseline_only_bool:
-        clock_run_bool = True
-        print("⚠️  Note: baseline_only=True implies clock_run=True")
-    
-    # If tokens_speculative is False, we need baseline comparison, so enable clock_run
-    if not tokens_speculative_bool:
-        clock_run_bool = True
-        print("⚠️  Note: tokens_speculative=False implies clock_run=True (for baseline comparison)")
-    
-    if record_output_bool and not clock_run_bool:
-        print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
-        record_output_bool = False
-
     os.chdir("/workspace")
     sys.path.insert(0, "/workspace")
     
@@ -128,7 +93,8 @@ def evaluate_speculative_decoding(
     
     # Load target (Coconut) model
     print(f"Loading target model from {target_checkpoint_path}...")
-    target_base_model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+    print(f"Using base model: {target_model_id}")
+    target_base_model = AutoModelForCausalLM.from_pretrained(target_model_id)
     target_base_model.resize_token_embeddings(len(tokenizer))
     
     from coconut import Coconut
@@ -164,7 +130,7 @@ def evaluate_speculative_decoding(
             end_id,
             eos_token_id,
             hidden_dim_base=512,
-            hidden_dim_target=768,
+            hidden_dim_target=target_hidden_dim,
         )
         
         # Load draft checkpoint
@@ -231,6 +197,9 @@ def evaluate_speculative_decoding(
     # HuggingFace Dataset iteration returns dicts directly
     dataset_samples = [dataset[i] for i in range(min(len(dataset), max_samples))]
     
+    # Track input sequence lengths for debugging
+    input_lengths = []
+    
     for idx, sample in enumerate(tqdm(dataset_samples, desc="Evaluating")):
         # Construct input with latent tokens
         # sample is a dict from HuggingFace Dataset
@@ -243,6 +212,9 @@ def evaluate_speculative_decoding(
             + [latent_id] * num_latent_thoughts
             + [end_id]
         )
+        
+        # Track input length for debugging
+        input_lengths.append(len(input_tokens))
         
         # Convert to tensors
         input_ids = torch.tensor(input_tokens, dtype=torch.long)
@@ -277,6 +249,7 @@ def evaluate_speculative_decoding(
                     rng=rng,
                     tokens_speculative=tokens_speculative_bool,
                     skip_latent_verification=skip_latent_verification_bool,
+                    target_hidden_dim=target_hidden_dim,
                 )
                 
                 # Accumulate statistics
@@ -489,6 +462,16 @@ def evaluate_speculative_decoding(
         avg_tokens = total_generated_tokens / num_samples
         print(f"  Average tokens per sample: {avg_tokens:.1f}")
     
+    # Debug: Print input sequence length statistics
+    if input_lengths:
+        avg_input_len = sum(input_lengths) / len(input_lengths)
+        min_input_len = min(input_lengths)
+        max_input_len = max(input_lengths)
+        print(f"\nInput Sequence Length Statistics:")
+        print(f"  Average input length: {avg_input_len:.1f} tokens")
+        print(f"  Min input length: {min_input_len} tokens")
+        print(f"  Max input length: {max_input_len} tokens")
+    
     print("=" * 60)
     
     # Save results to file
@@ -571,6 +554,174 @@ def evaluate_speculative_decoding(
         exact_matches = sum(1 for record in output_records if record["exact_match"])
         print(f"  Exact token matches: {exact_matches}/{len(output_records)} ({exact_matches/len(output_records):.1%})")
     
+    return use_medium_volume_bool
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB:1",
+    timeout=60 * 60 * 4,  # 4 hours
+    volumes={"/checkpoints": checkpoint_volume_medium},
+)
+def evaluate_speculative_decoding_medium(
+    draft_checkpoint_path: str,
+    target_checkpoint_path: str,
+    data_path: str = "data/prontoqa_test.json",
+    num_latent_thoughts: int = 6,
+    gamma: int = 6,
+    max_new_tokens: int = 50,
+    similarity_threshold: float = 0.9,
+    max_samples: int = 100,
+    clock_run: str = "True",
+    record_output: str = "False",
+    baseline_only: str = "False",
+    tokens_speculative: str = "False",
+    skip_latent_verification: str = "False",
+):
+    """
+    Evaluate speculative decoding with gpt2-medium models (uses medium volume).
+    
+    Args:
+        draft_checkpoint_path: Path to draft model checkpoint in gpt2-medium Modal volume
+        target_checkpoint_path: Path to target (Coconut) model checkpoint in gpt2-medium volume
+        data_path: Path to test data JSON file (default "data/prontoqa_test.json")
+        num_latent_thoughts: Number of latent thoughts to generate (default 6)
+        gamma: Number of draft tokens per round (default 6)
+        max_new_tokens: Maximum new tokens to generate (default 50)
+        similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
+        max_samples: Maximum number of samples to evaluate (default 100)
+        clock_run: Enable wallclock timing (default "True" for medium eval)
+        record_output: Record generated outputs for comparison (default "False")
+        baseline_only: Only run baseline (target model) decoding (default "False")
+        tokens_speculative: If False, use autoregressive generation with target model only after latent thoughts (default "False")
+        skip_latent_verification: If True, skip target model verification of latent thoughts (default "False")
+    """
+    # Parse string parameters to boolean
+    clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
+    record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
+    baseline_only_bool = baseline_only.lower() in ("true", "1", "yes", "on")
+    tokens_speculative_bool = tokens_speculative.lower() in ("true", "1", "yes", "on")
+    skip_latent_verification_bool = skip_latent_verification.lower() in ("true", "1", "yes", "on")
+    
+    # If baseline_only is True, clock_run must also be True
+    if baseline_only_bool:
+        clock_run_bool = True
+        print("⚠️  Note: baseline_only=True implies clock_run=True")
+    
+    # If tokens_speculative is False, we need baseline comparison, so enable clock_run
+    if not tokens_speculative_bool:
+        clock_run_bool = True
+        print("⚠️  Note: tokens_speculative=False implies clock_run=True (for baseline comparison)")
+    
+    if record_output_bool and not clock_run_bool:
+        print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
+        record_output_bool = False
+    
+    # Call the implementation
+    use_medium_volume_bool = _evaluate_speculative_decoding_impl(
+        draft_checkpoint_path=draft_checkpoint_path,
+        target_checkpoint_path=target_checkpoint_path,
+        data_path=data_path,
+        num_latent_thoughts=num_latent_thoughts,
+        gamma=gamma,
+        max_new_tokens=max_new_tokens,
+        similarity_threshold=similarity_threshold,
+        max_samples=max_samples,
+        clock_run_bool=clock_run_bool,
+        record_output_bool=record_output_bool,
+        baseline_only_bool=baseline_only_bool,
+        tokens_speculative_bool=tokens_speculative_bool,
+        skip_latent_verification_bool=skip_latent_verification_bool,
+        target_model_id="openai-community/gpt2-medium",
+        target_hidden_dim=1024,
+        use_medium_volume_bool=True,
+    )
+    
+    # Commit volume
+    checkpoint_volume_medium.commit()
+
+
+@app.function(
+    image=image,
+    gpu="A100:1",
+    timeout=60 * 60 * 4,  # 4 hours
+    volumes={"/checkpoints": checkpoint_volume},
+)
+def evaluate_speculative_decoding(
+    draft_checkpoint_path: str,
+    target_checkpoint_path: str,
+    data_path: str = "data/prontoqa_test.json",
+    num_latent_thoughts: int = 6,
+    gamma: int = 6,
+    max_new_tokens: int = 50,
+    similarity_threshold: float = 0.9,
+    max_samples: int = 100,
+    clock_run: str = "False",
+    record_output: str = "False",
+    baseline_only: str = "False",
+    tokens_speculative: str = "False",
+    skip_latent_verification: str = "False",
+):
+    """
+    Evaluate speculative decoding with draft and target models.
+    
+    Args:
+        draft_checkpoint_path: Path to draft model checkpoint in Modal volume
+        target_checkpoint_path: Path to target (Coconut) model checkpoint
+        data_path: Path to test data JSON file
+        num_latent_thoughts: Number of latent thoughts to generate (default 6)
+        gamma: Number of draft tokens per round (default 6)
+        max_new_tokens: Maximum new tokens to generate (default 50)
+        similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
+        max_samples: Maximum number of samples to evaluate (default 100)
+        clock_run: Enable wallclock timing. Accepts "True", "true", "1", "False", "false", "0" (default "False")
+        record_output: Record generated outputs for comparison. Requires clock_run=True. Accepts "True", "true", "1", etc. (default "False")
+        baseline_only: Only run baseline (target model) decoding, skip speculative decoding. Accepts "True", "true", "1", etc. (default "False")
+        tokens_speculative: If True, use speculative decoding for tokens. If False, use autoregressive generation with target model only after latent thoughts. Accepts "True", "true", "1", etc. (default "False")
+        skip_latent_verification: If True, skip target model verification of latent thoughts (use draft only). Much faster. Accepts "True", "true", "1", etc. (default "False")
+    """
+    # Parse string parameters to boolean
+    clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
+    record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
+    baseline_only_bool = baseline_only.lower() in ("true", "1", "yes", "on")
+    tokens_speculative_bool = tokens_speculative.lower() in ("true", "1", "yes", "on")
+    skip_latent_verification_bool = skip_latent_verification.lower() in ("true", "1", "yes", "on")
+    
+    # If baseline_only is True, clock_run must also be True
+    if baseline_only_bool:
+        clock_run_bool = True
+        print("⚠️  Note: baseline_only=True implies clock_run=True")
+    
+    # If tokens_speculative is False, we need baseline comparison, so enable clock_run
+    if not tokens_speculative_bool:
+        clock_run_bool = True
+        print("⚠️  Note: tokens_speculative=False implies clock_run=True (for baseline comparison)")
+    
+    if record_output_bool and not clock_run_bool:
+        print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
+        record_output_bool = False
+    
+    # Call the implementation
+    use_medium_volume_bool = _evaluate_speculative_decoding_impl(
+        draft_checkpoint_path=draft_checkpoint_path,
+        target_checkpoint_path=target_checkpoint_path,
+        data_path=data_path,
+        num_latent_thoughts=num_latent_thoughts,
+        gamma=gamma,
+        max_new_tokens=max_new_tokens,
+        similarity_threshold=similarity_threshold,
+        max_samples=max_samples,
+        clock_run_bool=clock_run_bool,
+        record_output_bool=record_output_bool,
+        baseline_only_bool=baseline_only_bool,
+        tokens_speculative_bool=tokens_speculative_bool,
+        skip_latent_verification_bool=skip_latent_verification_bool,
+        target_model_id="openai-community/gpt2",
+        target_hidden_dim=768,
+        use_medium_volume_bool=False,
+    )
+    
+    # Commit volume
     checkpoint_volume.commit()
 
 
@@ -579,6 +730,23 @@ def main():
     print("Speculative Decoding Evaluation")
     print("=" * 60)
     print()
+    print("GPT2-MEDIUM PRONTOQA EVALUATION:")
+    print("=" * 60)
+    print("Usage:")
+    print("  modal run modal_speculative_decode.py::evaluate_speculative_decoding_medium \\")
+    print("    --draft-checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/draft_checkpoints/draft_model_epoch_X.pt' \\")
+    print("    --target-checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25' \\")
+    print("    --data-path 'data/prosqa_test.json' \\")
+    print("    --num-latent-thoughts 6 \\")
+    print("    --gamma 6 \\")
+    print("    --max-new-tokens 50 \\")
+    print("    --similarity-threshold 0.9 \\")
+    print("    --max-samples 100 \\")
+    print("    --clock-run True \\")
+    print("    --tokens-speculative False")
+    print()
+    print("STANDARD GPT2 EVALUATION:")
+    print("=" * 60)
     print("Usage:")
     print("  modal run modal_speculative_decode.py::evaluate_speculative_decoding \\")
     print("    --draft-checkpoint-path '/checkpoints/draft_model/draft_model_epoch_10.pt' \\")

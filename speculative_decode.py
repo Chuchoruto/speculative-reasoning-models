@@ -24,8 +24,8 @@ def accept_latent_thought(
     Accept latent thought if cosine similarity > threshold.
     
     Args:
-        draft_vector: Draft model's latent thought [768]
-        target_vector: Target model's latent thought [768]
+        draft_vector: Draft model's latent thought [hidden_dim]
+        target_vector: Target model's latent thought [hidden_dim]
         threshold: Cosine similarity threshold (default 0.9)
     
     Returns:
@@ -85,6 +85,7 @@ def speculative_decode_latent_thoughts(
     gamma: int = 6,  # Unused, kept for API compatibility
     similarity_threshold: float = 0.9,
     device: torch.device = None,
+    target_hidden_dim: int = None,  # Auto-detect if None
 ) -> Tuple[List[bool], List[torch.Tensor], List[torch.Tensor], float, float]:
     """
     Generate draft latent thoughts sequentially (6 autoregressive calls),
@@ -107,6 +108,7 @@ def speculative_decode_latent_thoughts(
         gamma: Unused (kept for API compatibility)
         similarity_threshold: Cosine similarity threshold for acceptance
         device: Device to run on
+        target_hidden_dim: Target model hidden dimension (auto-detect if None)
     
     Returns:
         (acceptance_list, draft_thoughts, target_thoughts, draft_time, verify_time)
@@ -115,6 +117,17 @@ def speculative_decode_latent_thoughts(
     """
     if device is None:
         device = input_ids.device
+    
+    # Get target model's hidden dimension (auto-detect if not provided)
+    if target_hidden_dim is None:
+        # Try to get from model config
+        if hasattr(target_model, 'base_causallm') and hasattr(target_model.base_causallm, 'config'):
+            target_hidden_dim = target_model.base_causallm.config.n_embd
+        elif hasattr(target_model, 'config'):
+            target_hidden_dim = target_model.config.n_embd
+        else:
+            # Fallback: infer from embedding dimension
+            target_hidden_dim = target_model.embedding.weight.shape[1]
     
     # Expand to batch dimension
     input_ids_batch = input_ids.unsqueeze(0).to(device)
@@ -146,7 +159,11 @@ def speculative_decode_latent_thoughts(
             latent_positions=[sorted_latent_positions],  # All positions at once
         )
         
-        # Extract all draft latent thoughts (already projected to 768-dim)
+        # Ensure GPU synchronization for accurate timing
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        
+        # Extract all draft latent thoughts (already projected to target_hidden_dim)
         if draft_outputs.latent_thoughts and len(draft_outputs.latent_thoughts[0]) > 0:
             all_draft_thoughts = [
                 thought.to(device) if isinstance(thought, torch.Tensor) else torch.tensor(thought, device=device)
@@ -156,97 +173,154 @@ def speculative_decode_latent_thoughts(
     draft_time = draft_end_time - draft_start_time
     
     # Step 2: Construct input sequence with ALL draft latent thoughts embedded
-    # Get base embeddings from target model
-    with torch.no_grad():
-        base_embeddings = target_model.embedding(input_ids_batch)
-        
-        # Replace latent token positions with draft latent thoughts (768-dim)
-        for i, latent_pos in enumerate(sorted_latent_positions):
-            if i < len(all_draft_thoughts):
-                # Target model expects 768-dim embeddings
-                base_embeddings[0, latent_pos, :] = all_draft_thoughts[i]
-    
-    # Step 3: Target model verifies in ONE batched call using 6 parallel sequences
-    # Build a batch where sample k has first k-1 latent tokens replaced by draft thoughts
-    # and only the k-th position remains a latent token to collect one thought per batch row
+    # Replace latent token positions with draft latent thoughts for verification
     verify_start_time = time.perf_counter()
     with torch.no_grad():
-        batch_input_ids = []
-        batch_attention = []
-        batch_positions = []
-        batch_embeddings = []
-        # Use model-known special ids
-        latent_id = getattr(target_model, 'latent_token_id', None)
-        end_latent_id = getattr(target_model, 'end_latent_id', None)
-        # Fallback: keep the same id if not available
-        for k, pos_k in enumerate(sorted_latent_positions, start=1):
-            # Start from device tensors
-            ids_k = input_ids_batch[0].clone()  # [L] on device
-            # Ensure exactly ONE latent token remains at pos_k.
-            # All other latent positions are set to a non-latent token (end_latent or eos) to avoid multiple latents.
-            neutral_id = None
-            if hasattr(target_model, 'end_latent_id') and target_model.end_latent_id is not None:
-                neutral_id = target_model.end_latent_id
-            elif hasattr(target_model, 'eos_token_id') and target_model.eos_token_id is not None:
-                neutral_id = target_model.eos_token_id
+        # Get base embeddings from target model
+        base_embeddings = target_model.embedding(input_ids_batch)
+        
+        # Replace latent token positions with draft latent thoughts (target_hidden_dim-dim)
+        for i, latent_pos in enumerate(sorted_latent_positions):
+            if i < len(all_draft_thoughts):
+                # Ensure draft thought has correct dimension
+                draft_thought = all_draft_thoughts[i]
+                if isinstance(draft_thought, torch.Tensor):
+                    draft_thought = draft_thought.to(device)
+                    if draft_thought.dim() > 1:
+                        draft_thought = draft_thought.flatten()
+                    # Ensure correct dimension
+                    if draft_thought.shape[0] != target_hidden_dim:
+                        if draft_thought.shape[0] > target_hidden_dim:
+                            draft_thought = draft_thought[:target_hidden_dim]
+                        else:
+                            padding = torch.zeros(target_hidden_dim - draft_thought.shape[0], device=device)
+                            draft_thought = torch.cat([draft_thought, padding])
+                else:
+                    draft_thought = torch.tensor(draft_thought, device=device)
+                    if draft_thought.shape[0] != target_hidden_dim:
+                        if draft_thought.shape[0] > target_hidden_dim:
+                            draft_thought = draft_thought[:target_hidden_dim]
+                        else:
+                            padding = torch.zeros(target_hidden_dim - draft_thought.shape[0], device=device)
+                            draft_thought = torch.cat([draft_thought, padding])
+                base_embeddings[0, latent_pos, :] = draft_thought
+        
+        # Step 3: Call base model directly in ONE forward pass to get all hidden states
+        # This processes: question_input_seq -> draft_thought_1 -> draft_thought_2 -> ... -> draft_thought_6
+        # We extract hidden states at positions right BEFORE each draft thought (after processing up to that point)
+        # The hidden state at position i-1 represents the "verified thought" for draft_thought at position i
+        
+        # Get the base causal LM from Coconut
+        base_model = target_model.base_causallm
+        
+        # Process entire sequence in one forward pass with output_hidden_states=True
+        outputs = base_model(
+            inputs_embeds=base_embeddings,
+            attention_mask=attention_mask_batch,
+            position_ids=position_ids_batch,
+            output_hidden_states=True,  # Get all hidden states
+        )
+        
+        # Ensure GPU synchronization for accurate timing
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        
+        # Extract hidden states from the last layer: [batch_size, seq_len, hidden_dim]
+        # hidden_states[-1] is the last layer's hidden states
+        all_hidden_states = outputs.hidden_states[-1]  # [1, seq_len, target_hidden_dim]
+        
+        # Extract verified thought vectors right BEFORE each draft thought position
+        # The hidden state at position latent_pos - 1 represents the model's output AFTER processing
+        # everything up to (but not including) the draft thought at latent_pos
+        # This is the "verified thought" that represents what the model thinks should come at position latent_pos
+        # We compare this with the draft thought embedded at position latent_pos
+        all_target_thoughts = []
+        for i, latent_pos in enumerate(sorted_latent_positions):
+            # The verified thought is the hidden state at position latent_pos - 1
+            # (after processing sequence up to latent_pos, before processing draft_thought at latent_pos)
+            # For the first draft thought (latent_pos=0), use position 0
+            extract_pos = max(0, latent_pos - 1)
+            
+            if extract_pos < all_hidden_states.shape[1]:
+                # Extract hidden state: [target_hidden_dim]
+                verified_thought = all_hidden_states[0, extract_pos, :].clone()
+                all_target_thoughts.append(verified_thought)
             else:
-                # Fallback: if we don't have a neutral id, keep original id (worst case)
-                neutral_id = ids_k[pos_k].item()
-            for p in sorted_latent_positions:
-                if p != pos_k:
-                    ids_k[p] = neutral_id
-            # Build embeddings and overwrite previous positions with draft thoughts
-            emb_k = target_model.embedding(ids_k.unsqueeze(0))  # [1, L, 768] on device
-            for i_thought, prev_pos in enumerate(sorted_latent_positions[:k-1]):
-                if i_thought < len(all_draft_thoughts):
-                    emb_k[0, prev_pos, :] = all_draft_thoughts[i_thought]
-            batch_input_ids.append(ids_k.unsqueeze(0))
-            batch_attention.append(attention_mask_batch[0].unsqueeze(0))
-            batch_positions.append(position_ids_batch[0].unsqueeze(0))
-            batch_embeddings.append(emb_k)
-        # Stack batch
-        batch_input_ids = torch.cat(batch_input_ids, dim=0).to(device)
-        batch_attention = torch.cat(batch_attention, dim=0).to(device)
-        batch_positions = torch.cat(batch_positions, dim=0).to(device)
-        batch_embeddings = torch.cat(batch_embeddings, dim=0).to(device)
-        dummy_labels = torch.full(
-            (batch_input_ids.shape[0], batch_input_ids.shape[1]),
-            -100,
-            dtype=torch.long,
-            device=device,
-        )
-        # One forward pass for all k
-        target_outputs = target_model(
-            input_ids=batch_input_ids,
-            attention_mask=batch_attention,
-            position_ids=batch_positions,
-            labels=dummy_labels,
-            collect_latent_thoughts=True,
-            inputs_embeds=batch_embeddings,
-        )
-        # With one latent per batch row, the model will collect exactly one thought per row in batch order
-        raw_thoughts = target_outputs.latent_thoughts if target_outputs.latent_thoughts else []
-        all_target_thoughts = [
-            t.to(device) if isinstance(t, torch.Tensor) else torch.tensor(t, device=device)
-            for t in raw_thoughts
-        ]
+                # Fallback: use last hidden state if position is out of bounds
+                verified_thought = all_hidden_states[0, -1, :].clone()
+                all_target_thoughts.append(verified_thought)
+        
+        # Ensure we have the right number of thoughts
+        if len(all_target_thoughts) != len(sorted_latent_positions):
+            # Pad or truncate to match expected count
+            while len(all_target_thoughts) < len(sorted_latent_positions):
+                all_target_thoughts.append(torch.zeros(target_hidden_dim, device=device))
+            all_target_thoughts = all_target_thoughts[:len(sorted_latent_positions)]
     verify_end_time = time.perf_counter()
     verify_time = verify_end_time - verify_start_time
     
-    # Step 4: Verify all latent thoughts in parallel
-    all_acceptance = []
+    # Step 4: Verify all latent thoughts in parallel (vectorized)
     min_len = min(len(all_draft_thoughts), len(all_target_thoughts), num_latent_thoughts)
+    
+    if min_len == 0:
+        return [], [], [], draft_time, verify_time
+    
+    # Stack all draft and target thoughts into tensors for vectorized comparison
+    # Shape: [min_len, target_hidden_dim]
+    draft_stack = []
+    target_stack = []
     
     for i in range(min_len):
         draft_vec = all_draft_thoughts[i]
         target_vec = all_target_thoughts[i]
         
-        accepted = accept_latent_thought(
-            draft_vec,
-            target_vec,
-            threshold=similarity_threshold
-        )
-        all_acceptance.append(accepted)
+        # Ensure both are tensors on the same device with correct shape [target_hidden_dim]
+        if isinstance(draft_vec, torch.Tensor):
+            draft_vec = draft_vec.to(device)
+            if draft_vec.dim() > 1:
+                draft_vec = draft_vec.flatten()
+        else:
+            draft_vec = torch.tensor(draft_vec, device=device)
+        
+        if isinstance(target_vec, torch.Tensor):
+            target_vec = target_vec.to(device)
+            if target_vec.dim() > 1:
+                target_vec = target_vec.flatten()
+        else:
+            target_vec = torch.tensor(target_vec, device=device)
+        
+        # Ensure both are exactly [target_hidden_dim] for comparison
+        if draft_vec.shape[0] != target_hidden_dim:
+            if draft_vec.shape[0] > target_hidden_dim:
+                draft_vec = draft_vec[:target_hidden_dim]
+            else:
+                padding = torch.zeros(target_hidden_dim - draft_vec.shape[0], device=device)
+                draft_vec = torch.cat([draft_vec, padding])
+        
+        if target_vec.shape[0] != target_hidden_dim:
+            if target_vec.shape[0] > target_hidden_dim:
+                target_vec = target_vec[:target_hidden_dim]
+            else:
+                padding = torch.zeros(target_hidden_dim - target_vec.shape[0], device=device)
+                target_vec = torch.cat([target_vec, padding])
+        
+        draft_stack.append(draft_vec)
+        target_stack.append(target_vec)
+    
+    # Stack into tensors: [min_len, target_hidden_dim]
+    draft_tensor = torch.stack(draft_stack, dim=0)  # [min_len, target_hidden_dim]
+    target_tensor = torch.stack(target_stack, dim=0)  # [min_len, target_hidden_dim]
+    
+    # Vectorized cosine similarity computation
+    # Normalize both tensors
+    draft_norm = torch.nn.functional.normalize(draft_tensor, p=2, dim=1)  # [min_len, target_hidden_dim]
+    target_norm = torch.nn.functional.normalize(target_tensor, p=2, dim=1)  # [min_len, target_hidden_dim]
+    
+    # Compute cosine similarities: [min_len]
+    cosine_similarities = (draft_norm * target_norm).sum(dim=1)  # [min_len]
+    
+    # Vectorized acceptance check
+    all_acceptance = (cosine_similarities >= similarity_threshold).cpu().tolist()
     
     # Return only the verified thoughts (slice to min_len)
     return all_acceptance, all_draft_thoughts[:min_len], all_target_thoughts[:min_len], draft_time, verify_time
@@ -547,6 +621,7 @@ def speculative_decode(
     rng: Optional[np.random.Generator] = None,
     tokens_speculative: bool = False,
     skip_latent_verification: bool = False,
+    target_hidden_dim: int = None,  # Auto-detect if None
 ) -> Tuple[List[int], dict]:
     """
     Full speculative decoding pipeline: latent thoughts + tokens.
@@ -567,12 +642,24 @@ def speculative_decode(
         rng: Random number generator
         tokens_speculative: If True, use speculative decoding for tokens. If False, use autoregressive generation with target model only.
         skip_latent_verification: If True, skip target model verification of latent thoughts (use draft only). Much faster but less accurate.
+        target_hidden_dim: Target model hidden dimension (auto-detect if None)
     
     Returns:
         (generated_tokens, stats_dict)
     """
     if device is None:
         device = input_ids.device
+    
+    # Get target model's hidden dimension (auto-detect if not provided)
+    if target_hidden_dim is None:
+        # Try to get from model config
+        if hasattr(target_model, 'base_causallm') and hasattr(target_model.base_causallm, 'config'):
+            target_hidden_dim = target_model.base_causallm.config.n_embd
+        elif hasattr(target_model, 'config'):
+            target_hidden_dim = target_model.config.n_embd
+        else:
+            # Fallback: infer from embedding dimension
+            target_hidden_dim = target_model.embedding.weight.shape[1]
     
     if rng is None:
         rng = np.random.default_rng()
@@ -637,6 +724,7 @@ def speculative_decode(
             gamma=gamma,
             similarity_threshold=similarity_threshold,
             device=device,
+            target_hidden_dim=target_hidden_dim,
         )
         # Count draft calls for latent thoughts (now just one call for all thoughts)
         stats['num_draft_calls'] = 1  # Draft model called once for all latent thoughts
@@ -783,6 +871,10 @@ def baseline_autoregressive_decode(
             labels=dummy_labels,
             collect_latent_thoughts=True,  # Collect latent thoughts
         )
+        
+        # Ensure GPU synchronization for accurate timing
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
     
     latent_end_time = time.perf_counter()
     latent_thought_time = latent_end_time - latent_start_time
