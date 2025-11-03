@@ -32,6 +32,8 @@ image = (
 
 # Use the same persistent volume
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
+# Separate volume for gpt2-medium runs
+checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medium", create_if_missing=True)
 
 @app.function(
     image=image,
@@ -162,6 +164,63 @@ def train_prontoqa_coconut(cot_checkpoint_path: str = None):
     
     # Commit the volume to persist changes
     checkpoint_volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB:4",
+    timeout=60 * 60 * 24,
+    volumes={"/checkpoints": checkpoint_volume_medium},
+    secrets=[modal.Secret.from_name("wandb")],
+)
+def train_prontoqa_coconut_medium(cot_checkpoint_path: str = None):
+    """
+    Train ProntoQA Coconut model using gpt2-medium on a dedicated volume.
+    Uses args/prontoqa_coconut.yaml as base and overrides model_id/name/save_path.
+    """
+    import subprocess
+    import os
+    import yaml
+    
+    os.chdir("/workspace")
+    
+    # Load base prontoqa config
+    config_path = "args/prontoqa_coconut.yaml"
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    
+    # Override for gpt2-medium and separate volume path/name
+    config["model_id"] = "openai-community/gpt2-medium"
+    config["name"] = "prontoqa-coconut-gpt2-medium"
+    # Save into dedicated subdirectory inside the mounted volume
+    config["save_path"] = "/checkpoints/gpt2medium-prontoqa-checkpoints"
+    if cot_checkpoint_path:
+        config["load_model_path"] = cot_checkpoint_path
+        print(f"Loading CoT checkpoint from: {cot_checkpoint_path}")
+    else:
+        print(f"Using load_model_path from config: {config.get('load_model_path', 'None')}")
+    
+    modal_config_path = "prontoqa_coconut_medium_modal.yaml"
+    with open(modal_config_path, "w") as f:
+        yaml.dump(config, f)
+    
+    print("Starting ProntoQA Coconut (gpt2-medium) training with 4x A100 GPUs...")
+    print(f"Training config: {modal_config_path}")
+    
+    subprocess.run([
+        "torchrun",
+        "--nnodes", "1",
+        "--nproc_per_node", "4",
+        "run.py",
+        modal_config_path
+    ], check=True)
+    
+    print("ProntoQA Coconut (gpt2-medium) training completed!")
+    print("Checkpoints saved to: /checkpoints/gpt2medium-prontoqa-checkpoints/")
+    checkpoint_volume_medium.commit()
 
 
 @app.local_entrypoint()
