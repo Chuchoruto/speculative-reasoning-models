@@ -28,12 +28,13 @@ def compute_loss(
     teacher_latent_thoughts_list,  # List of [num_latent, 768] tensors
     target_tokens_list,  # List of [num_targets] tensors
     target_positions_list,  # List of position lists
+    ce_weight=1.0,
     kl_weight=1.0,
-    mse_weight=1.0,
+    cosine_weight=1.0,
     temperature=1.0,
 ):
     """
-    Compute mixed loss: KL divergence for logits + MSE for latent thoughts.
+    Compute mixed loss: Causal LM (CE) + KL divergence for logits + Cosine similarity for latent thoughts.
     
     Args:
         student_logits: Student model logits [batch, seq, vocab]
@@ -42,15 +43,22 @@ def compute_loss(
         teacher_latent_thoughts_list: Teacher latent thoughts per sample
         target_tokens_list: Target token IDs per sample
         target_positions_list: Target positions per sample
+        ce_weight: Weight for causal LM (CrossEntropy) loss
         kl_weight: Weight for KL divergence loss
-        mse_weight: Weight for MSE loss
+        cosine_weight: Weight for cosine similarity loss (1 - cosine_sim)
         temperature: Temperature for softmax in KL divergence
     """
     batch_size = student_logits.shape[0]
+    device = student_logits.device
+    
+    # For causal LM loss: collect all logits and labels
+    ce_logits_list = []
+    ce_labels_list = []
+    
     total_kl_loss = 0.0
-    total_mse_loss = 0.0
+    total_cosine_loss = 0.0
     num_kl_samples = 0
-    num_mse_samples = 0
+    num_cosine_samples = 0
     
     # Process each sample in the batch
     for batch_idx in range(batch_size):
@@ -63,16 +71,29 @@ def compute_loss(
         # Student logits at position i predict token at position i+1
         # So for target position pos, we use logits at pos-1
         student_logits_sample_list = []
-        for pos in target_positions_sample:
+        target_tokens_aligned = []
+        for i, pos in enumerate(target_positions_sample):
             if pos > 0:  # Can't predict from position 0
                 logit_pos = pos - 1
                 if logit_pos < student_logits.shape[1]:
                     student_logits_sample_list.append(student_logits[batch_idx, logit_pos, :])
+                    # Get corresponding target token
+                    if i < len(target_tokens_sample):
+                        target_tokens_aligned.append(target_tokens_sample[i])
         
         if len(student_logits_sample_list) == 0:
             continue
         
         student_logits_sample = torch.stack(student_logits_sample_list)  # [num_targets, vocab]
+        
+        # Collect for CE loss: align logits with target tokens
+        if len(target_tokens_aligned) > 0:
+            target_tokens_tensor = torch.stack(target_tokens_aligned).to(device)
+            # Align lengths
+            min_len = min(len(student_logits_sample), len(target_tokens_tensor))
+            if min_len > 0:
+                ce_logits_list.append(student_logits_sample[:min_len])
+                ce_labels_list.append(target_tokens_tensor[:min_len])
         
         # Align with teacher logits (take minimum length)
         min_len = min(len(student_logits_sample), len(teacher_logits_sample))
@@ -119,30 +140,59 @@ def compute_loss(
                     # Ensure shapes match
                     min_latent_len = min(len(student_latents_stacked), len(teacher_latents))
                     if min_latent_len > 0:
-                        mse_loss = F.mse_loss(
-                            student_latents_stacked[:min_latent_len],
-                            teacher_latents[:min_latent_len]
-                        )
-                        total_mse_loss += mse_loss
-                        num_mse_samples += 1
+                        student_aligned = student_latents_stacked[:min_latent_len]  # [min_len, 768]
+                        teacher_aligned = teacher_latents[:min_latent_len]  # [min_len, 768]
+                        
+                        # Cosine similarity loss: 1 - cosine_similarity (minimize distance, maximize similarity)
+                        # Compute cosine similarity per latent thought
+                        cosine_sims = F.cosine_similarity(
+                            student_aligned, 
+                            teacher_aligned, 
+                            dim=-1
+                        )  # [min_len] - one similarity per latent thought
+                        
+                        # Loss is 1 - cosine_similarity (ranges from 0 to 2, 0 when identical)
+                        cosine_loss = (1.0 - cosine_sims).mean()
+                        total_cosine_loss += cosine_loss
+                        num_cosine_samples += 1
                 except Exception as e:
                     # Skip if stacking fails (e.g., empty list or shape mismatch)
                     # This should not happen often - log if it does
                     pass
     
+    # Compute CE loss (causal LM loss)
+    ce_loss = torch.tensor(0.0, device=device)
+    num_ce_samples = 0
+    if len(ce_logits_list) > 0 and len(ce_labels_list) > 0:
+        # Concatenate all logits and labels
+        all_ce_logits = torch.cat(ce_logits_list, dim=0)  # [total_targets, vocab]
+        all_ce_labels = torch.cat(ce_labels_list, dim=0)  # [total_targets]
+        
+        # Compute CrossEntropyLoss
+        ce_criterion = torch.nn.CrossEntropyLoss()
+        ce_loss = ce_criterion(all_ce_logits, all_ce_labels)
+        num_ce_samples = len(ce_logits_list)
+    
     # Average losses
-    avg_kl_loss = total_kl_loss / num_kl_samples if num_kl_samples > 0 else torch.tensor(0.0, device=student_logits.device)
-    avg_mse_loss = total_mse_loss / num_mse_samples if num_mse_samples > 0 else torch.tensor(0.0, device=student_logits.device)
+    avg_ce_loss = ce_loss  # Already averaged across all tokens
+    avg_kl_loss = total_kl_loss / num_kl_samples if num_kl_samples > 0 else torch.tensor(0.0, device=device)
+    avg_cosine_loss = total_cosine_loss / num_cosine_samples if num_cosine_samples > 0 else torch.tensor(0.0, device=device)
     
     # Combined loss
-    total_loss = kl_weight * avg_kl_loss + mse_weight * avg_mse_loss
+    total_loss = (
+        ce_weight * avg_ce_loss +
+        kl_weight * avg_kl_loss +
+        cosine_weight * avg_cosine_loss
+    )
     
     return {
         'total_loss': total_loss,
+        'ce_loss': avg_ce_loss,
         'kl_loss': avg_kl_loss,
-        'mse_loss': avg_mse_loss,
+        'cosine_loss': avg_cosine_loss,
+        'num_ce_samples': num_ce_samples,
         'num_kl_samples': num_kl_samples,
-        'num_mse_samples': num_mse_samples,
+        'num_cosine_samples': num_cosine_samples,
     }
 
 
@@ -151,8 +201,9 @@ def train_epoch(
     dataloader,
     optimizer,
     device,
+    ce_weight=1.0,
     kl_weight=1.0,
-    mse_weight=1.0,
+    cosine_weight=1.0,
     temperature=1.0,
     wandb_run=None,
     global_step=0,
@@ -162,8 +213,9 @@ def train_epoch(
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
+    total_ce = 0.0
     total_kl = 0.0
-    total_mse = 0.0
+    total_cosine = 0.0
     num_batches = 0
     
     # Only show progress bar on rank 0
@@ -209,8 +261,9 @@ def train_epoch(
             teacher_latent_thoughts,
             target_tokens,
             batch['target_positions'],
+            ce_weight=ce_weight,
             kl_weight=kl_weight,
-            mse_weight=mse_weight,
+            cosine_weight=cosine_weight,
             temperature=temperature,
         )
         
@@ -227,35 +280,128 @@ def train_epoch(
         
         # Update metrics
         total_loss += loss.item()
+        total_ce += loss_dict['ce_loss'].item()
         total_kl += loss_dict['kl_loss'].item()
-        total_mse += loss_dict['mse_loss'].item()
+        total_cosine += loss_dict['cosine_loss'].item()
         num_batches += 1
         global_step += 1
         
         # Update progress bar
         pbar.set_postfix({
             'loss': loss.item(),
+            'ce': loss_dict['ce_loss'].item(),
             'kl': loss_dict['kl_loss'].item(),
-            'mse': loss_dict['mse_loss'].item(),
+            'cos': loss_dict['cosine_loss'].item(),
         })
         
         # Log to wandb
         if wandb_run is not None and batch_idx % 10 == 0:  # Log every 10 batches
             wandb_run.log({
                 'train/loss': loss.item(),
+                'train/ce_loss': loss_dict['ce_loss'].item(),
                 'train/kl_loss': loss_dict['kl_loss'].item(),
-                'train/mse_loss': loss_dict['mse_loss'].item(),
+                'train/cosine_loss': loss_dict['cosine_loss'].item(),
+                'train/num_ce_samples': loss_dict['num_ce_samples'],
                 'train/num_kl_samples': loss_dict['num_kl_samples'],
-                'train/num_mse_samples': loss_dict['num_mse_samples'],
+                'train/num_cosine_samples': loss_dict['num_cosine_samples'],
                 'train/learning_rate': optimizer.param_groups[0]['lr'],
                 'train/step': global_step,
             })
     
     return {
         'avg_loss': total_loss / num_batches,
+        'avg_ce': total_ce / num_batches,
         'avg_kl': total_kl / num_batches,
-        'avg_mse': total_mse / num_batches,
+        'avg_cosine': total_cosine / num_batches,
     }, global_step
+
+
+def validate_epoch(
+    model,
+    dataloader,
+    device,
+    ce_weight=1.0,
+    kl_weight=1.0,
+    cosine_weight=1.0,
+    temperature=1.0,
+    wandb_run=None,
+    rank=0,
+    world_size=1,
+):
+    """Validate for one epoch (no gradient updates)."""
+    model.eval()
+    total_loss = 0.0
+    total_ce = 0.0
+    total_kl = 0.0
+    total_cosine = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        # Only show progress bar on rank 0
+        pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
+        for batch_idx, batch in enumerate(pbar):
+            # Move to device
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            position_ids = batch['position_ids'].to(device)
+            
+            # Move target data to device (lists of tensors)
+            teacher_logits = [logits.to(device) for logits in batch['target_logits']]
+            teacher_latent_thoughts = [thoughts.to(device) for thoughts in batch['latent_thoughts']]
+            target_tokens = [tokens.to(device) for tokens in batch['target_tokens']]
+            
+            # Forward pass - use known latent positions from dataset
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                collect_latent_thoughts=True,
+                latent_positions=batch['latent_positions'],  # Pass known positions
+            )
+            
+            # Move student latent thoughts to device (already organized by sample)
+            student_latent_thoughts_by_sample = [
+                [thought.to(device) for thought in sample_latents]
+                for sample_latents in outputs.latent_thoughts
+            ] if outputs.latent_thoughts else [[] for _ in range(input_ids.shape[0])]
+            
+            # Compute loss
+            loss_dict = compute_loss(
+                outputs.logits,
+                teacher_logits,
+                student_latent_thoughts_by_sample,
+                teacher_latent_thoughts,
+                target_tokens,
+                batch['target_positions'],
+                ce_weight=ce_weight,
+                kl_weight=kl_weight,
+                cosine_weight=cosine_weight,
+                temperature=temperature,
+            )
+            
+            loss = loss_dict['total_loss']
+            
+            # Update metrics
+            total_loss += loss.item()
+            total_ce += loss_dict['ce_loss'].item()
+            total_kl += loss_dict['kl_loss'].item()
+            total_cosine += loss_dict['cosine_loss'].item()
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': loss.item(),
+                'ce': loss_dict['ce_loss'].item(),
+                'kl': loss_dict['kl_loss'].item(),
+                'cos': loss_dict['cosine_loss'].item(),
+            })
+    
+    return {
+        'avg_loss': total_loss / num_batches,
+        'avg_ce': total_ce / num_batches,
+        'avg_kl': total_kl / num_batches,
+        'avg_cosine': total_cosine / num_batches,
+    }
 
 
 def main():
@@ -338,10 +484,10 @@ def main():
     if use_distributed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
-    # Load dataset
+    # Load training dataset
     if rank == 0:
-        print(f"Loading dataset from {config['data_json_path']}...")
-    dataset = DraftDataset(
+        print(f"Loading training dataset from {config['data_json_path']}...")
+    train_dataset = DraftDataset(
         json_path=config['data_json_path'],
         data_dir=config.get('data_dir', None),
     )
@@ -350,25 +496,56 @@ def main():
     
     # Create distributed sampler if using distributed training
     if use_distributed:
-        sampler = DistributedSampler(
-            dataset,
+        train_sampler = DistributedSampler(
+            train_dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
         )
         shuffle = False  # Sampler handles shuffling
     else:
-        sampler = None
+        train_sampler = None
         shuffle = True
     
-    dataloader = DataLoader(
-        dataset,
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_size=config.get('batch_size', 32),
         shuffle=shuffle,
-        sampler=sampler,
+        sampler=train_sampler,
         num_workers=config.get('num_workers', 4),
         collate_fn=collator,
     )
+    
+    # Load validation dataset if provided
+    val_dataloader = None
+    val_sampler = None
+    if config.get('val_json_path'):
+        if rank == 0:
+            print(f"Loading validation dataset from {config['val_json_path']}...")
+        val_dataset = DraftDataset(
+            json_path=config['val_json_path'],
+            data_dir=config.get('val_data_dir', config.get('data_dir', None)),
+        )
+        
+        # Validation sampler (no shuffle, no distributed needed but can use it for consistency)
+        if use_distributed:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,  # No shuffle for validation
+            )
+        else:
+            val_sampler = None
+        
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=config.get('batch_size', 32),
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=config.get('num_workers', 4),
+            collate_fn=collator,
+        )
     
     # Setup optimizer
     optimizer = torch.optim.AdamW(
@@ -405,30 +582,33 @@ def main():
         threshold=0.03,  # Require at least 3% relative improvement to count as progress
         threshold_mode='rel',  # Relative threshold mode
     )
+    ce_weight = config.get('ce_weight', 1.0)
     kl_weight = config.get('kl_weight', 1.0)
-    mse_weight = config.get('mse_weight', 1.0)
+    cosine_weight = config.get('cosine_weight', 1.0)
     temperature = config.get('temperature', 1.0)
     
     if rank == 0:
         print(f"\nStarting training for {num_epochs} epochs...")
-        print(f"Loss weights: KL={kl_weight}, MSE={mse_weight}")
+        print(f"Loss weights: CE={ce_weight}, KL={kl_weight}, Cosine={cosine_weight}")
     
     global_step = 0
     for epoch in range(num_epochs):
         # Set epoch for distributed sampler
         if use_distributed:
-            sampler.set_epoch(epoch)
+            train_sampler.set_epoch(epoch)
         
         if rank == 0:
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
-        metrics, global_step = train_epoch(
+        # Training
+        train_metrics, global_step = train_epoch(
             model,
-            dataloader,
+            train_dataloader,
             optimizer,
             device,
+            ce_weight=ce_weight,
             kl_weight=kl_weight,
-            mse_weight=mse_weight,
+            cosine_weight=cosine_weight,
             temperature=temperature,
             wandb_run=wandb_run,
             global_step=global_step,
@@ -437,17 +617,48 @@ def main():
         )
         
         if rank == 0:
-            print(f"Epoch {epoch + 1} - Loss: {metrics['avg_loss']:.4f}, "
-                  f"KL: {metrics['avg_kl']:.4f}, MSE: {metrics['avg_mse']:.4f}")
+            print(f"Epoch {epoch + 1} - Train Loss: {train_metrics['avg_loss']:.4f}, "
+                  f"CE: {train_metrics['avg_ce']:.4f}, KL: {train_metrics['avg_kl']:.4f}, Cosine: {train_metrics['avg_cosine']:.4f}")
+        
+        # Validation
+        val_metrics = None
+        if val_dataloader is not None:
+            if rank == 0:
+                print("Running validation...")
+            val_metrics = validate_epoch(
+                model,
+                val_dataloader,
+                device,
+                ce_weight=ce_weight,
+                kl_weight=kl_weight,
+                cosine_weight=cosine_weight,
+                temperature=temperature,
+                wandb_run=wandb_run,
+                rank=rank,
+                world_size=world_size,
+            )
+            
+            if rank == 0:
+                print(f"Epoch {epoch + 1} - Val Loss: {val_metrics['avg_loss']:.4f}, "
+                      f"CE: {val_metrics['avg_ce']:.4f}, KL: {val_metrics['avg_kl']:.4f}, Cosine: {val_metrics['avg_cosine']:.4f}")
         
         # Log epoch metrics to wandb (only on rank 0)
         if wandb_run is not None:
-            wandb_run.log({
+            log_dict = {
                 'epoch': epoch + 1,
-                'epoch/loss': metrics['avg_loss'],
-                'epoch/kl_loss': metrics['avg_kl'],
-                'epoch/mse_loss': metrics['avg_mse'],
-            })
+                'epoch/train_loss': train_metrics['avg_loss'],
+                'epoch/train_ce_loss': train_metrics['avg_ce'],
+                'epoch/train_kl_loss': train_metrics['avg_kl'],
+                'epoch/train_cosine_loss': train_metrics['avg_cosine'],
+            }
+            if val_metrics is not None:
+                log_dict.update({
+                    'epoch/val_loss': val_metrics['avg_loss'],
+                    'epoch/val_ce_loss': val_metrics['avg_ce'],
+                    'epoch/val_kl_loss': val_metrics['avg_kl'],
+                    'epoch/val_cosine_loss': val_metrics['avg_cosine'],
+                })
+            wandb_run.log(log_dict)
         
         # Update learning rate schedulers
         # Only on rank 0 to avoid multiple print statements
@@ -455,8 +666,11 @@ def main():
             # Step exponential decay scheduler (decays every epoch)
             scheduler.step()
             
-            # Also check plateau scheduler for additional reduction when KL plateaus
-            plateau_scheduler.step(metrics['avg_kl'])
+            # Also check plateau scheduler for additional reduction when CE loss plateaus
+            # Use validation CE loss if available, otherwise training CE loss
+            # (CE loss is more critical for sequence coherence)
+            ce_loss_for_scheduler = val_metrics['avg_ce'] if val_metrics is not None else train_metrics['avg_ce']
+            plateau_scheduler.step(ce_loss_for_scheduler)
             
             current_lr = optimizer.param_groups[0]['lr']
             if wandb_run is not None:
@@ -472,11 +686,18 @@ def main():
                 config['save_path'],
                 f"draft_model_epoch_{epoch + 1}.pt"
             )
+            # Save both training and validation metrics
+            checkpoint_metrics = {
+                'train_metrics': train_metrics,
+            }
+            if val_metrics is not None:
+                checkpoint_metrics['val_metrics'] = val_metrics
+            
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
-                'metrics': metrics,
+                'metrics': checkpoint_metrics,
                 'config': config,
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
