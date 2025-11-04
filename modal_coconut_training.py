@@ -124,7 +124,7 @@ def train_prontoqa_coconut(cot_checkpoint_path: str = None):
     os.chdir("/workspace")
     
     # Load existing prontoqa config
-    config_path = "args/prontoqa_coconut.yaml"
+    config_path = "args/prontoqa_coconut-final.yaml"
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
     
@@ -159,7 +159,7 @@ def train_prontoqa_coconut(cot_checkpoint_path: str = None):
     ], check=True)
     
     print("ProntoQA Coconut training completed!")
-    print("Checkpoints saved to: /checkpoints/prontoqa-coconut/")
+    print(f"Checkpoints saved to: /checkpoints/{config['name']}/")
     print("Look for checkpoint with best validation accuracy")
     
     # Commit the volume to persist changes
@@ -173,10 +173,14 @@ def train_prontoqa_coconut(cot_checkpoint_path: str = None):
     volumes={"/checkpoints": checkpoint_volume_medium},
     secrets=[modal.Secret.from_name("wandb")],
 )
-def train_prontoqa_coconut_medium(cot_checkpoint_path: str = None):
+def train_prontoqa_coconut_medium(cot_checkpoint_path: str = None, resume_checkpoint_path: str = None):
     """
     Train ProntoQA Coconut model using gpt2-medium on a dedicated volume.
     Uses args/prontoqa_coconut.yaml as base and overrides model_id/name/save_path.
+    
+    Args:
+        cot_checkpoint_path: Optional CoT checkpoint path to start from (for initial training)
+        resume_checkpoint_path: Optional checkpoint path to resume from (e.g., checkpoint_25)
     """
     import subprocess
     import os
@@ -197,7 +201,22 @@ def train_prontoqa_coconut_medium(cot_checkpoint_path: str = None):
     config["name"] = "prontoqa-coconut-gpt2-medium"
     # Save into dedicated subdirectory inside the mounted volume
     config["save_path"] = "/checkpoints/gpt2medium-prontoqa-checkpoints"
-    if cot_checkpoint_path:
+    
+    # Handle resume from checkpoint
+    if resume_checkpoint_path:
+        config["load_model_path"] = resume_checkpoint_path
+        # Extract epoch number from checkpoint path (e.g., checkpoint_25 -> 25)
+        try:
+            checkpoint_name = os.path.basename(resume_checkpoint_path.rstrip('/'))
+            epoch_num = int(checkpoint_name.split("_")[1])
+            config["resume"] = epoch_num
+            print(f"Resuming training from checkpoint: {resume_checkpoint_path}")
+            print(f"Will continue from epoch {epoch_num + 1} to {config.get('num_epochs', 50)}")
+        except (ValueError, IndexError):
+            print(f"Warning: Could not extract epoch number from {resume_checkpoint_path}")
+            print("Setting resume to 0 - training will auto-detect from checkpoint directory")
+            config["resume"] = 0
+    elif cot_checkpoint_path:
         config["load_model_path"] = cot_checkpoint_path
         print(f"Loading CoT checkpoint from: {cot_checkpoint_path}")
     else:
@@ -232,10 +251,20 @@ def main():
     print("  modal run modal_coconut_training.py::train_coconut \\")
     print("    --cot-checkpoint-path '/checkpoints/gsm-cot/checkpoint_25'")
     print()
-    print("ProntoQA Training:")
+    print("ProntoQA Training (GPT2):")
     print("  modal run modal_coconut_training.py::train_prontoqa_coconut")
     print("    (or with CoT checkpoint:)")
     print("  modal run modal_coconut_training.py::train_prontoqa_coconut \\")
     print("    --cot-checkpoint-path '/checkpoints/prontoqa-cot/checkpoint_X'")
+    print()
+    print("ProntoQA Training (GPT2-medium):")
+    print("  modal run modal_coconut_training.py::train_prontoqa_coconut_medium")
+    print("    (or with CoT checkpoint:)")
+    print("  modal run modal_coconut_training.py::train_prontoqa_coconut_medium \\")
+    print("    --cot-checkpoint-path '/checkpoints/path/to/cot/checkpoint'")
+    print()
+    print("  (or resume from existing checkpoint:)")
+    print("  modal run modal_coconut_training.py::train_prontoqa_coconut_medium \\")
+    print("    --resume-checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25'")
     print()
     print("Note: ProntoQA training uses args/prontoqa_coconut.yaml config")
