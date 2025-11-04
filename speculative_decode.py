@@ -111,9 +111,10 @@ def speculative_decode_latent_thoughts(
         target_hidden_dim: Target model hidden dimension (auto-detect if None)
     
     Returns:
-        (acceptance_list, draft_thoughts, target_thoughts, draft_time, verify_time)
+        (acceptance_list, draft_thoughts, target_thoughts, draft_time, verify_time, logits)
         - draft_time: Time taken to generate draft latent thoughts
         - verify_time: Time taken to verify with target model
+        - logits: Logits from target model verification [batch_size, seq_len, vocab_size] or None
     """
     if device is None:
         device = input_ids.device
@@ -263,7 +264,7 @@ def speculative_decode_latent_thoughts(
     min_len = min(len(all_draft_thoughts), len(all_target_thoughts), num_latent_thoughts)
     
     if min_len == 0:
-        return [], [], [], draft_time, verify_time
+        return [], [], [], draft_time, verify_time, None
     
     # Stack all draft and target thoughts into tensors for vectorized comparison
     # Shape: [min_len, target_hidden_dim]
@@ -323,7 +324,9 @@ def speculative_decode_latent_thoughts(
     all_acceptance = (cosine_similarities >= similarity_threshold).cpu().tolist()
     
     # Return only the verified thoughts (slice to min_len)
-    return all_acceptance, all_draft_thoughts[:min_len], all_target_thoughts[:min_len], draft_time, verify_time
+    # Also return logits from the target model for extracting first token
+    target_logits = outputs.logits if hasattr(outputs, 'logits') else None
+    return all_acceptance, all_draft_thoughts[:min_len], all_target_thoughts[:min_len], draft_time, verify_time, target_logits
 
 
 def speculative_decode_tokens(
@@ -711,9 +714,10 @@ def speculative_decode(
         # Time draft generation
         draft_latent_time = draft_gen_end - draft_gen_start
         verify_latent_time = 0.0  # No verification
+        verification_logits = None  # No verification, so no logits
     else:
         # Generate and verify with both models
-        acceptance_list, draft_thoughts, target_thoughts, draft_latent_time, verify_latent_time = speculative_decode_latent_thoughts(
+        acceptance_list, draft_thoughts, target_thoughts, draft_latent_time, verify_latent_time, verification_logits = speculative_decode_latent_thoughts(
             draft_model,
             target_model,
             input_ids,
@@ -729,6 +733,8 @@ def speculative_decode(
         # Count draft calls for latent thoughts (now just one call for all thoughts)
         stats['num_draft_calls'] = 1  # Draft model called once for all latent thoughts
         stats['num_target_calls'] = 1  # Target model called once for all latent thoughts (parallel verification)
+        # Note: This counts as 1 call per sample, even though Coconut processes 6 latent tokens internally.
+        # The parallel verification strategy allows us to verify all 6 latent thoughts in a single forward pass.
     
     latent_end_time = time.perf_counter()
     latent_time = latent_end_time - latent_start_time
@@ -749,26 +755,49 @@ def speculative_decode(
         # Assuming sequence structure: ... <start-latent> <latent>*6 <end-latent> ...
         # We want to start from after <end-latent> or after the last latent token
         last_latent_pos = max(latent_positions)
-        start_pos = last_latent_pos + 1
+        start_pos = last_latent_pos + 1  # Position of <end-latent> token
     else:
         start_pos = len(input_ids)
     
-    # Create sequence from start of input to position after latent tokens
-    if start_pos < len(input_ids):
-        token_input_ids = input_ids[:start_pos].clone()
-        token_attention_mask = attention_mask[:start_pos].clone()
-        token_position_ids = position_ids[:start_pos].clone()
+    # Extract the first token from latent verification logits (if available)
+    # This token was generated "for free" during latent verification
+    generated_tokens = []
+    if not skip_latent_verification and verification_logits is not None and start_pos < verification_logits.shape[1]:
+        # Extract logits for the first token after <end-latent>
+        # logits[start_pos] predicts the token at position start_pos + 1
+        first_token_logits = verification_logits[0, start_pos, :]  # [vocab_size]
+        first_token = torch.argmax(first_token_logits).item()
+        generated_tokens.append(first_token)
+    
+    # Create sequence from start of input to position after latent tokens (or after first token if extracted)
+    if len(generated_tokens) > 0:
+        # We already extracted the first token, so start from after it
+        if start_pos + 1 < len(input_ids):
+            token_input_ids = input_ids[:start_pos + 2].clone()  # Include first token if in input
+            token_attention_mask = attention_mask[:start_pos + 2].clone()
+            token_position_ids = position_ids[:start_pos + 2].clone()
+        else:
+            # First token is beyond input_ids, append it
+            token_input_ids = torch.cat([input_ids.clone(), torch.tensor([generated_tokens[0]], device=input_ids.device)], dim=0)
+            token_attention_mask = torch.cat([attention_mask.clone(), torch.ones(1, device=input_ids.device, dtype=torch.long)], dim=0)
+            token_position_ids = torch.cat([position_ids.clone(), torch.tensor([position_ids[-1].item() + 1], device=input_ids.device)], dim=0)
     else:
-        # If we're already at the end, use full sequence
-        token_input_ids = input_ids.clone()
-        token_attention_mask = attention_mask.clone()
-        token_position_ids = position_ids.clone()
+        # No first token extracted, start from <end-latent>
+        if start_pos < len(input_ids):
+            token_input_ids = input_ids[:start_pos + 1].clone()  # Include <end-latent>
+            token_attention_mask = attention_mask[:start_pos + 1].clone()
+            token_position_ids = position_ids[:start_pos + 1].clone()
+        else:
+            # If we're already at the end, use full sequence
+            token_input_ids = input_ids.clone()
+            token_attention_mask = attention_mask.clone()
+            token_position_ids = position_ids.clone()
     
     # Generate tokens: either speculative decoding or normal autoregressive
     token_start_time = time.perf_counter()
     if tokens_speculative:
         # Use speculative decoding for tokens
-        generated_tokens, num_draft_tokens, num_target_tokens, tokens_accepted, tokens_total = speculative_decode_tokens(
+        additional_tokens, num_draft_tokens, num_target_tokens, tokens_accepted, tokens_total = speculative_decode_tokens(
             draft_model,
             target_model,
             token_input_ids,
@@ -780,13 +809,15 @@ def speculative_decode(
             device=device,
             rng=rng,
         )
+        # Prepend the first token (if extracted) to the generated tokens
+        generated_tokens = generated_tokens + additional_tokens
         stats['num_draft_calls'] += num_draft_tokens
         stats['num_target_calls'] += num_target_tokens
         stats['tokens_accepted'] = tokens_accepted
         stats['tokens_total'] = tokens_total
     else:
         # Use normal autoregressive generation with target model only
-        generated_tokens = autoregressive_token_generation(
+        additional_tokens = autoregressive_token_generation(
             target_model,
             token_input_ids,
             token_attention_mask,
@@ -795,8 +826,12 @@ def speculative_decode(
             eos_token_id=eos_token_id,
             device=device,
         )
+        # Prepend the first token (if extracted) to the generated tokens
+        generated_tokens = generated_tokens + additional_tokens
         # Count target model calls: one per token generated
-        stats['num_target_calls'] += len(generated_tokens)
+        # Note: stats['num_target_calls'] already includes 1 call from latent verification (if not skipped)
+        # Here we add the token generation calls (one per token)
+        stats['num_target_calls'] += len(additional_tokens)
         stats['tokens_accepted'] = len(generated_tokens)  # All tokens are "accepted" (no rejection in autoregressive)
         stats['tokens_total'] = len(generated_tokens)
     token_end_time = time.perf_counter()
@@ -882,29 +917,53 @@ def baseline_autoregressive_decode(
     # Get the position after latent tokens
     if len(latent_positions) > 0:
         last_latent_pos = max(latent_positions)
-        start_pos = last_latent_pos + 1
+        start_pos = last_latent_pos + 1  # Position of <end-latent> token
+        # The first token after <end-latent> is at position start_pos + 1
+        # Logits[i] predicts token[i+1], so logits[start_pos] predicts token at start_pos+1
+        first_token_pos = start_pos + 1
     else:
         start_pos = len(input_ids)
+        first_token_pos = len(input_ids)
     
-    # Create sequence from start of input to position after latent tokens
-    if start_pos < len(input_ids):
-        current_input_ids = input_ids[:start_pos].clone().to(device)
-        current_attention_mask = attention_mask[:start_pos].clone().to(device)
-        current_position_ids = position_ids[:start_pos].clone().to(device)
+    # Extract the first token from the logits returned during latent thought processing
+    # This token was generated "for free" during latent processing
+    generated_tokens = []
+    if first_token_pos < outputs.logits.shape[1]:
+        # Extract logits for the first token after <end-latent>
+        # logits[start_pos] predicts the token at position start_pos + 1
+        first_token_logits = outputs.logits[0, start_pos, :]  # [vocab_size]
+        first_token = torch.argmax(first_token_logits).item()
+        generated_tokens.append(first_token)
+        
+        # Create sequence from start of input to position after first token
+        # This includes the first token we just extracted
+        if first_token_pos < len(input_ids):
+            current_input_ids = input_ids[:first_token_pos + 1].clone().to(device)
+            current_attention_mask = attention_mask[:first_token_pos + 1].clone().to(device)
+            current_position_ids = position_ids[:first_token_pos + 1].clone().to(device)
+        else:
+            # First token is beyond input_ids, append it
+            current_input_ids = torch.cat([input_ids.clone().to(device), torch.tensor([first_token], device=device)], dim=0)
+            current_attention_mask = torch.cat([attention_mask.clone().to(device), torch.ones(1, device=device, dtype=torch.long)], dim=0)
+            current_position_ids = torch.cat([position_ids.clone().to(device), torch.tensor([position_ids[-1].item() + 1], device=device)], dim=0)
     else:
-        current_input_ids = input_ids.clone().to(device)
-        current_attention_mask = attention_mask.clone().to(device)
-        current_position_ids = position_ids.clone().to(device)
+        # No token generated during latent processing, start from <end-latent>
+        if start_pos < len(input_ids):
+            current_input_ids = input_ids[:start_pos + 1].clone().to(device)
+            current_attention_mask = attention_mask[:start_pos + 1].clone().to(device)
+            current_position_ids = position_ids[:start_pos + 1].clone().to(device)
+        else:
+            current_input_ids = input_ids.clone().to(device)
+            current_attention_mask = attention_mask.clone().to(device)
+            current_position_ids = position_ids.clone().to(device)
     
     # Expand to batch dimension for generation
     current_input_ids = current_input_ids.unsqueeze(0)
     current_attention_mask = current_attention_mask.unsqueeze(0)
     current_position_ids = current_position_ids.unsqueeze(0)
     
-    # Step 2: Generate tokens autoregressively and time it
+    # Step 2: Generate remaining tokens autoregressively and time it
     token_start_time = time.perf_counter()
-    
-    generated_tokens = []
     
     # Autoregressive generation
     for _ in range(max_new_tokens):

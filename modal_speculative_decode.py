@@ -259,7 +259,14 @@ def _evaluate_speculative_decoding_impl(
                 total_target_calls += stats['num_target_calls']
                 total_tokens_accepted += stats.get('tokens_accepted', 0)
                 total_tokens_total += stats.get('tokens_total', 0)
-                total_generated_tokens += len(generated_tokens)
+                # Count tokens: use len(generated_tokens) directly to ensure we count all tokens
+                # This is the authoritative source since it's what gets written to JSON
+                if generated_tokens is not None:
+                    num_tokens_this_sample = len(generated_tokens)
+                    total_generated_tokens += num_tokens_this_sample
+                else:
+                    # Fallback to stats if generated_tokens is None
+                    total_generated_tokens += stats.get('tokens_total', 0)
                 
                 # Track timing (always track if we have timing data)
                 speculative_time = stats.get('wallclock_time', 0.0)
@@ -376,8 +383,12 @@ def _evaluate_speculative_decoding_impl(
         print(f"  Total calls: {total_draft_calls + total_target_calls}")
         
         # Estimated speedup based on model calls
-        baseline_target_calls = total_generated_tokens
+        # Baseline: 6 latent thought calls per sample (Coconut processes latent tokens sequentially)
+        #            + token generation calls (one per token)
+        baseline_target_calls = (num_latent_thoughts * num_samples) + total_generated_tokens
         print(f"  Baseline (target-only) calls: {baseline_target_calls}")
+        print(f"    - Latent thought calls: {num_latent_thoughts * num_samples}")
+        print(f"    - Token generation calls: {total_generated_tokens}")
         
         if baseline_target_calls > 0:
             # Estimated speedup = baseline_target_calls / total_target_calls
