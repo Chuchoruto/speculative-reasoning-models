@@ -430,7 +430,7 @@ def _evaluate_speculative_decoding_impl(
         print(f"    Total latent thought time: {total_baseline_latent_time:.4f}s")
         print(f"    Total token generation time: {total_baseline_token_time:.4f}s")
         
-        if avg_baseline_time > 0:
+        if avg_baseline_time > 0 and avg_speculative_time > 0:
             actual_speedup = avg_baseline_time / avg_speculative_time
             latent_speedup = avg_base_latent_time / avg_spec_latent_time if avg_spec_latent_time > 0 else 0.0
             token_speedup = avg_base_token_time / avg_spec_token_time if avg_spec_token_time > 0 else 0.0
@@ -451,6 +451,9 @@ def _evaluate_speculative_decoding_impl(
             actual_speedup = 0.0
             latent_speedup = 0.0
             token_speedup = 0.0
+            if baseline_only_bool:
+                print(f"\n  Speedup Analysis:")
+                print(f"    (Baseline-only mode: no speculative decoding to compare)")
     else:
         actual_speedup = 0.0
         latent_speedup = 0.0

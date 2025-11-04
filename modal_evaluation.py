@@ -32,6 +32,8 @@ image = (
 
 # Use the same persistent volume
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
+# Separate volume for gpt2-medium
+checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medium", create_if_missing=True)
 
 @app.function(
     image=image,
@@ -137,6 +139,51 @@ def evaluate_prontoqa_model(checkpoint_path: str):
     print("Evaluation completed!")
     print("Check the logs for final test accuracy results")
 
+@app.function(
+    image=image,
+    gpu="A100-80GB:4",
+    timeout=60 * 60 * 2,  # 2 hour timeout for evaluation
+    volumes={"/checkpoints": checkpoint_volume_medium},  # Mount medium volume
+    secrets=[modal.Secret.from_name("wandb")],
+)
+def evaluate_prontoqa_model_medium(checkpoint_path: str):
+    """Evaluate the trained ProntoQA Coconut GPT2-medium model with 4x A100 GPUs"""
+    import subprocess
+    import os
+    
+    os.chdir("/workspace")
+    
+    print(f"Evaluating ProntoQA GPT2-medium model from: {checkpoint_path}")
+    
+    # Load the prontoqa eval config
+    with open("args/prontoqa_coconut_eval.yaml", "r") as f:
+        config_dict = yaml.safe_load(f)
+    
+    # Update the checkpoint path, save_path, and model_id for GPT2-medium
+    config_dict["load_model_path"] = checkpoint_path
+    config_dict["save_path"] = "/checkpoints"
+    config_dict["model_id"] = "openai-community/gpt2-medium"  # Use GPT2-medium
+    
+    with open("prontoqa_eval_modal_medium.yaml", "w") as f:
+        yaml.dump(config_dict, f)
+    
+    print("Starting evaluation on ProntoQA test set (GPT2-medium)...")
+    print(f"Config: {config_dict}")
+    
+    subprocess.run([
+        "torchrun",
+        "--nnodes", "1",
+        "--nproc_per_node", "4",
+        "run.py",
+        "prontoqa_eval_modal_medium.yaml"
+    ], check=True)
+    
+    print("Evaluation completed!")
+    print("Check the logs for final test accuracy results")
+    
+    # Commit volume to persist results
+    checkpoint_volume_medium.commit()
+
 @app.local_entrypoint()
 def main():
     print("Starting Model Evaluation...")
@@ -144,5 +191,7 @@ def main():
     print("You need to specify the best Coconut checkpoint path.")
     print("\nFor GSM8K evaluation:")
     print("modal run modal_evaluation.py::evaluate_model --checkpoint-path '/checkpoints/gsm-coconut/checkpoint_25'")
-    print("\nFor ProntoQA evaluation:")
+    print("\nFor ProntoQA evaluation (GPT2):")
     print("modal run modal_evaluation.py::evaluate_prontoqa_model --checkpoint-path '/checkpoints/prontoqa-coconut/checkpoint_50'")
+    print("\nFor ProntoQA evaluation (GPT2-medium):")
+    print("modal run modal_evaluation.py::evaluate_prontoqa_model_medium --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25'")
