@@ -19,6 +19,6 @@ for k, v in file.items():
         }
     )
 
-json.dump(data[:2000], open("data/prontoqa_train.json", "w"))
-json.dump(data[2000:2100], open("data/prontoqa_valid.json", "w"))
-json.dump(data[2100:2500], open("data/prontoqa_test.json", "w"))
+json.dump(data[:400], open("data/prontoqa_train.json", "w"))
+json.dump(data[400:420], open("data/prontoqa_valid.json", "w"))
+json.dump(data[420:], open("data/prontoqa_test.json", "w"))
