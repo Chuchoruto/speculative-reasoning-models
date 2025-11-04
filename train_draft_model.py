@@ -1,6 +1,6 @@
 """
 Training script for draft model.
-Uses mixed loss: KL divergence for logits + MSE for latent thoughts.
+Uses mixed loss: KL divergence for logits + Cosine similarity for latent thoughts.
 Includes WandB logging.
 """
 
@@ -26,34 +26,26 @@ def compute_loss(
     teacher_logits_list,  # List of [num_targets, vocab] tensors (one per sample)
     student_latent_thoughts_list,  # List of [768] tensors
     teacher_latent_thoughts_list,  # List of [num_latent, 768] tensors
-    target_tokens_list,  # List of [num_targets] tensors
     target_positions_list,  # List of position lists
-    ce_weight=1.0,
     kl_weight=1.0,
     cosine_weight=1.0,
     temperature=1.0,
 ):
     """
-    Compute mixed loss: Causal LM (CE) + KL divergence for logits + Cosine similarity for latent thoughts.
+    Compute mixed loss: KL divergence for logits + Cosine similarity for latent thoughts.
     
     Args:
         student_logits: Student model logits [batch, seq, vocab]
         teacher_logits_list: Teacher logits per sample
         student_latent_thoughts_list: Student latent thoughts per sample
         teacher_latent_thoughts_list: Teacher latent thoughts per sample
-        target_tokens_list: Target token IDs per sample
         target_positions_list: Target positions per sample
-        ce_weight: Weight for causal LM (CrossEntropy) loss
         kl_weight: Weight for KL divergence loss
         cosine_weight: Weight for cosine similarity loss (1 - cosine_sim)
         temperature: Temperature for softmax in KL divergence
     """
     batch_size = student_logits.shape[0]
     device = student_logits.device
-    
-    # For causal LM loss: collect all logits and labels
-    ce_logits_list = []
-    ce_labels_list = []
     
     total_kl_loss = 0.0
     total_cosine_loss = 0.0
@@ -62,38 +54,24 @@ def compute_loss(
     
     # Process each sample in the batch
     for batch_idx in range(batch_size):
-        # Get teacher logits and target tokens for this sample
+        # Get teacher logits for this sample
         teacher_logits_sample = teacher_logits_list[batch_idx]  # [num_targets, vocab]
-        target_tokens_sample = target_tokens_list[batch_idx]  # [num_targets]
         target_positions_sample = target_positions_list[batch_idx]  # List of positions
         
         # Get corresponding student logits at target positions
         # Student logits at position i predict token at position i+1
         # So for target position pos, we use logits at pos-1
         student_logits_sample_list = []
-        target_tokens_aligned = []
-        for i, pos in enumerate(target_positions_sample):
+        for pos in target_positions_sample:
             if pos > 0:  # Can't predict from position 0
                 logit_pos = pos - 1
                 if logit_pos < student_logits.shape[1]:
                     student_logits_sample_list.append(student_logits[batch_idx, logit_pos, :])
-                    # Get corresponding target token
-                    if i < len(target_tokens_sample):
-                        target_tokens_aligned.append(target_tokens_sample[i])
         
         if len(student_logits_sample_list) == 0:
             continue
         
         student_logits_sample = torch.stack(student_logits_sample_list)  # [num_targets, vocab]
-        
-        # Collect for CE loss: align logits with target tokens
-        if len(target_tokens_aligned) > 0:
-            target_tokens_tensor = torch.stack(target_tokens_aligned).to(device)
-            # Align lengths
-            min_len = min(len(student_logits_sample), len(target_tokens_tensor))
-            if min_len > 0:
-                ce_logits_list.append(student_logits_sample[:min_len])
-                ce_labels_list.append(target_tokens_tensor[:min_len])
         
         # Align with teacher logits (take minimum length)
         min_len = min(len(student_logits_sample), len(teacher_logits_sample))
@@ -118,14 +96,13 @@ def compute_loss(
         total_kl_loss += kl_loss
         num_kl_samples += 1
         
-        # MSE loss for latent thoughts
+        # Cosine similarity loss for latent thoughts
         if (batch_idx < len(student_latent_thoughts_list) and 
             batch_idx < len(teacher_latent_thoughts_list)):
             
-            student_latents = student_latent_thoughts_list[batch_idx]  # List of [768] tensors
-            teacher_latents = teacher_latent_thoughts_list[batch_idx]  # [num_latent, 768]
+            student_latents = student_latent_thoughts_list[batch_idx]  # List of [hidden_dim] tensors
+            teacher_latents = teacher_latent_thoughts_list[batch_idx]  # [num_latent, hidden_dim]
             
-            # Debug: check what we have
             student_count = len(student_latents) if student_latents else 0
             teacher_count = len(teacher_latents) if teacher_latents is not None else 0
             
@@ -135,13 +112,13 @@ def compute_loss(
                     student_latents_stacked = torch.stack([
                         thought.to(teacher_latents.device) 
                         for thought in student_latents
-                    ])  # [num_student_latents, 768]
+                    ])  # [num_student_latents, hidden_dim]
                     
                     # Ensure shapes match
                     min_latent_len = min(len(student_latents_stacked), len(teacher_latents))
                     if min_latent_len > 0:
-                        student_aligned = student_latents_stacked[:min_latent_len]  # [min_len, 768]
-                        teacher_aligned = teacher_latents[:min_latent_len]  # [min_len, 768]
+                        student_aligned = student_latents_stacked[:min_latent_len]  # [min_len, hidden_dim]
+                        teacher_aligned = teacher_latents[:min_latent_len]  # [min_len, hidden_dim]
                         
                         # Cosine similarity loss: 1 - cosine_similarity (minimize distance, maximize similarity)
                         # Compute cosine similarity per latent thought
@@ -157,40 +134,22 @@ def compute_loss(
                         num_cosine_samples += 1
                 except Exception as e:
                     # Skip if stacking fails (e.g., empty list or shape mismatch)
-                    # This should not happen often - log if it does
                     pass
     
-    # Compute CE loss (causal LM loss)
-    ce_loss = torch.tensor(0.0, device=device)
-    num_ce_samples = 0
-    if len(ce_logits_list) > 0 and len(ce_labels_list) > 0:
-        # Concatenate all logits and labels
-        all_ce_logits = torch.cat(ce_logits_list, dim=0)  # [total_targets, vocab]
-        all_ce_labels = torch.cat(ce_labels_list, dim=0)  # [total_targets]
-        
-        # Compute CrossEntropyLoss
-        ce_criterion = torch.nn.CrossEntropyLoss()
-        ce_loss = ce_criterion(all_ce_logits, all_ce_labels)
-        num_ce_samples = len(ce_logits_list)
-    
     # Average losses
-    avg_ce_loss = ce_loss  # Already averaged across all tokens
     avg_kl_loss = total_kl_loss / num_kl_samples if num_kl_samples > 0 else torch.tensor(0.0, device=device)
     avg_cosine_loss = total_cosine_loss / num_cosine_samples if num_cosine_samples > 0 else torch.tensor(0.0, device=device)
     
-    # Combined loss
+    # Combined loss (only KL + Cosine)
     total_loss = (
-        ce_weight * avg_ce_loss +
         kl_weight * avg_kl_loss +
         cosine_weight * avg_cosine_loss
     )
     
     return {
         'total_loss': total_loss,
-        'ce_loss': avg_ce_loss,
         'kl_loss': avg_kl_loss,
         'cosine_loss': avg_cosine_loss,
-        'num_ce_samples': num_ce_samples,
         'num_kl_samples': num_kl_samples,
         'num_cosine_samples': num_cosine_samples,
     }
@@ -201,7 +160,6 @@ def train_epoch(
     dataloader,
     optimizer,
     device,
-    ce_weight=1.0,
     kl_weight=1.0,
     cosine_weight=1.0,
     temperature=1.0,
@@ -247,7 +205,6 @@ def train_epoch(
         # Move target data to device (lists of tensors)
         teacher_logits = [logits.to(device) for logits in batch['target_logits']]
         teacher_latent_thoughts = [thoughts.to(device) for thoughts in batch['latent_thoughts']]
-        target_tokens = [tokens.to(device) for tokens in batch['target_tokens']]
         
         # Forward pass - use known latent positions from dataset
         outputs = model(
@@ -277,9 +234,7 @@ def train_epoch(
             teacher_logits,
             student_latent_thoughts_by_sample,
             teacher_latent_thoughts,
-            target_tokens,
             batch['target_positions'],
-            ce_weight=ce_weight,
             kl_weight=kl_weight,
             cosine_weight=cosine_weight,
             temperature=temperature,
@@ -296,7 +251,6 @@ def train_epoch(
         # Update metrics (use unscaled loss for logging)
         unscaled_loss = loss.item() * effective_grad_accum_steps
         total_loss += unscaled_loss
-        total_ce += loss_dict['ce_loss'].item()
         total_kl += loss_dict['kl_loss'].item()
         total_cosine += loss_dict['cosine_loss'].item()
         num_batches += 1
@@ -321,7 +275,6 @@ def train_epoch(
             # Update progress bar
             pbar.set_postfix({
                 'loss': unscaled_loss,
-                'ce': loss_dict['ce_loss'].item(),
                 'kl': loss_dict['kl_loss'].item(),
                 'cos': loss_dict['cosine_loss'].item(),
                 'step': global_step,
@@ -331,10 +284,8 @@ def train_epoch(
             if wandb_run is not None:
                 wandb_run.log({
                     'train/loss': unscaled_loss,
-                    'train/ce_loss': loss_dict['ce_loss'].item(),
                     'train/kl_loss': loss_dict['kl_loss'].item(),
                     'train/cosine_loss': loss_dict['cosine_loss'].item(),
-                    'train/num_ce_samples': loss_dict['num_ce_samples'],
                     'train/num_kl_samples': loss_dict['num_kl_samples'],
                     'train/num_cosine_samples': loss_dict['num_cosine_samples'],
                     'train/learning_rate': optimizer.param_groups[0]['lr'],
@@ -344,7 +295,6 @@ def train_epoch(
             # Just update progress bar without logging to wandb
             pbar.set_postfix({
                 'loss': unscaled_loss,
-                'ce': loss_dict['ce_loss'].item(),
                 'kl': loss_dict['kl_loss'].item(),
                 'cos': loss_dict['cosine_loss'].item(),
                 'acc': f'{(batch_idx + 1) % effective_grad_accum_steps}/{effective_grad_accum_steps}',
@@ -369,7 +319,6 @@ def train_epoch(
     
     return {
         'avg_loss': total_loss / num_batches,
-        'avg_ce': total_ce / num_batches,
         'avg_kl': total_kl / num_batches,
         'avg_cosine': total_cosine / num_batches,
     }, global_step
@@ -380,7 +329,6 @@ def validate_epoch(
     dataloader,
     device,
     tokenizer,
-    ce_weight=1.0,
     kl_weight=1.0,
     cosine_weight=1.0,
     temperature=1.0,
@@ -392,7 +340,6 @@ def validate_epoch(
     """Validate for one epoch (no gradient updates) with exact match accuracy."""
     model.eval()
     total_loss = 0.0
-    total_ce = 0.0
     total_kl = 0.0
     total_cosine = 0.0
     num_batches = 0
@@ -440,9 +387,7 @@ def validate_epoch(
                 teacher_logits,
                 student_latent_thoughts_by_sample,
                 teacher_latent_thoughts,
-                target_tokens,
                 batch['target_positions'],
-                ce_weight=ce_weight,
                 kl_weight=kl_weight,
                 cosine_weight=cosine_weight,
                 temperature=temperature,
@@ -452,7 +397,6 @@ def validate_epoch(
             
             # Update metrics
             total_loss += loss.item()
-            total_ce += loss_dict['ce_loss'].item()
             total_kl += loss_dict['kl_loss'].item()
             total_cosine += loss_dict['cosine_loss'].item()
             num_batches += 1
@@ -515,7 +459,6 @@ def validate_epoch(
             current_accuracy = exact_matches / total_token_predictions if total_token_predictions > 0 else 0.0
             pbar.set_postfix({
                 'loss': loss.item(),
-                'ce': loss_dict['ce_loss'].item(),
                 'kl': loss_dict['kl_loss'].item(),
                 'cos': loss_dict['cosine_loss'].item(),
                 'acc': f'{current_accuracy:.2%}',
@@ -541,7 +484,6 @@ def validate_epoch(
     
     return {
         'avg_loss': total_loss / num_batches,
-        'avg_ce': total_ce / num_batches,
         'avg_kl': total_kl / num_batches,
         'avg_cosine': total_cosine / num_batches,
         'exact_match_accuracy': exact_match_accuracy,
@@ -743,14 +685,13 @@ def main():
         threshold_mode='rel',  # Relative threshold mode
     )
     
-    ce_weight = config.get('ce_weight', 1.0)
     kl_weight = config.get('kl_weight', 1.0)
     cosine_weight = config.get('cosine_weight', 1.0)
     temperature = config.get('temperature', 1.0)
     
     if rank == 0:
         print(f"\nStarting training for {num_epochs} epochs...")
-        print(f"Loss weights: CE={ce_weight}, KL={kl_weight}, Cosine={cosine_weight}")
+        print(f"Loss weights: KL={kl_weight}, Cosine={cosine_weight}")
         print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
         print(f"Warmup steps: {warmup_steps}")
         print(f"Warmup peak LR: {peak_lr}")
@@ -772,7 +713,6 @@ def main():
             train_dataloader,
             optimizer,
             device,
-            ce_weight=ce_weight,
             kl_weight=kl_weight,
             cosine_weight=cosine_weight,
             temperature=temperature,
@@ -787,7 +727,7 @@ def main():
         
         if rank == 0:
             print(f"Epoch {epoch + 1} - Train Loss: {train_metrics['avg_loss']:.4f}, "
-                  f"CE: {train_metrics['avg_ce']:.4f}, KL: {train_metrics['avg_kl']:.4f}, Cosine: {train_metrics['avg_cosine']:.4f}")
+                  f"KL: {train_metrics['avg_kl']:.4f}, Cosine: {train_metrics['avg_cosine']:.4f}")
         
         # Validation
         val_metrics = None
@@ -799,7 +739,6 @@ def main():
                 val_dataloader,
                 device,
                 tokenizer,
-                ce_weight=ce_weight,
                 kl_weight=kl_weight,
                 cosine_weight=cosine_weight,
                 temperature=temperature,
@@ -811,7 +750,7 @@ def main():
             
             if rank == 0:
                 print(f"Epoch {epoch + 1} - Val Loss: {val_metrics['avg_loss']:.4f}, "
-                      f"CE: {val_metrics['avg_ce']:.4f}, KL: {val_metrics['avg_kl']:.4f}, Cosine: {val_metrics['avg_cosine']:.4f}")
+                      f"KL: {val_metrics['avg_kl']:.4f}, Cosine: {val_metrics['avg_cosine']:.4f}")
                 print(f"Epoch {epoch + 1} - Val Exact Match Accuracy: {val_metrics['exact_match_accuracy']:.2%} "
                       f"({val_metrics['exact_matches']}/{val_metrics['total_predictions']})")
         
@@ -820,14 +759,12 @@ def main():
             log_dict = {
                 'epoch': epoch + 1,
                 'epoch/train_loss': train_metrics['avg_loss'],
-                'epoch/train_ce_loss': train_metrics['avg_ce'],
                 'epoch/train_kl_loss': train_metrics['avg_kl'],
                 'epoch/train_cosine_loss': train_metrics['avg_cosine'],
             }
             if val_metrics is not None:
                 log_dict.update({
                     'epoch/val_loss': val_metrics['avg_loss'],
-                    'epoch/val_ce_loss': val_metrics['avg_ce'],
                     'epoch/val_kl_loss': val_metrics['avg_kl'],
                     'epoch/val_cosine_loss': val_metrics['avg_cosine'],
                     'epoch/val_exact_match_accuracy': val_metrics['exact_match_accuracy'],
@@ -840,10 +777,9 @@ def main():
             # Note: lr_scheduler is already stepped per update in train_epoch
             # Here we only step the plateau scheduler (per epoch)
             
-            # Check plateau scheduler for additional reduction when CE loss plateaus
-            # Use validation CE loss if available, otherwise training CE loss
-            ce_loss_for_scheduler = val_metrics['avg_ce'] if val_metrics is not None else train_metrics['avg_ce']
-            plateau_scheduler.step(ce_loss_for_scheduler)
+            # Use validation KL loss if available, otherwise training KL loss
+            kl_loss_for_scheduler = val_metrics['avg_kl'] if val_metrics is not None else train_metrics['avg_kl']
+            plateau_scheduler.step(kl_loss_for_scheduler)
             
             current_lr = optimizer.param_groups[0]['lr']
             if wandb_run is not None:

@@ -44,16 +44,17 @@ checkpoint_volume_medium = modal.Volume.from_name("coconut-checkpoints-gpt2-medi
     secrets=[modal.Secret.from_name("wandb")],  # WandB secret
 )
 def train_draft_model(
-    data_json_filename: str = "draft_training_data.json",
-    val_json_filename: str = None,
+    data_json_filename: str = "prontoqa_train_draft_training_data_standard.json",
+    val_json_filename: str = "prontoqa_valid_draft_training_data_standard.json",
     batch_size: int = 32,
     num_epochs: int = 10,
     lr: float = 1e-4,
     weight_decay: float = 0.01,
-    ce_weight: float = 1.0,
     kl_weight: float = 1.0,
     cosine_weight: float = 1.0,
     temperature: float = 1.0,
+    gradient_accumulation_steps: int = 4,
+    warmup_steps: int = 20,
     wandb_project: str = "draft-model-training",
     wandb_run_name: str = None,
 ):
@@ -61,16 +62,17 @@ def train_draft_model(
     Train draft model using data from Modal volume.
     
     Args:
-        data_json_filename: Name of JSON metadata file in /checkpoints/draft_data/
-        val_json_filename: Optional name of validation JSON metadata file in /checkpoints/draft_data/
-        batch_size: Training batch size per GPU (effective batch size = batch_size * 2)
+        data_json_filename: Name of JSON metadata file in /checkpoints/draft_data_pqa/
+        val_json_filename: Optional name of validation JSON metadata file in /checkpoints/draft_data_pqa/
+        batch_size: Training batch size per GPU (effective batch size = batch_size * 4 with 4 GPUs)
         num_epochs: Number of training epochs
         lr: Learning rate
         weight_decay: Weight decay for optimizer (L2 regularization)
-        ce_weight: Weight for causal LM (CrossEntropy) loss
         kl_weight: Weight for KL divergence loss
         cosine_weight: Weight for cosine similarity loss (latent thoughts)
         temperature: Temperature for softmax in KL divergence
+        gradient_accumulation_steps: Number of batches to accumulate gradients before updating (default: 4)
+        warmup_steps: Number of warmup steps for learning rate (default: 20)
         wandb_project: WandB project name
         wandb_run_name: WandB run name (auto-generated if None)
     """
@@ -80,18 +82,18 @@ def train_draft_model(
     os.chdir("/workspace")
     
     # Paths in Modal volume
-    data_json_path = f"/checkpoints/draft_data/{data_json_filename}"
-    data_dir = "/checkpoints/draft_data"  # Directory with NPZ files
-    save_path = "/checkpoints/draft_model"
+    data_json_path = f"/checkpoints/draft_data_pqa/{data_json_filename}"
+    data_dir = "/checkpoints/draft_data_pqa"  # Directory with NPZ files
+    save_path = "/checkpoints/draft_model_final"
     
     os.makedirs(save_path, exist_ok=True)
     
     # Verify training data exists
     if not os.path.exists(data_json_path):
-        available_files = os.listdir("/checkpoints/draft_data/") if os.path.exists("/checkpoints/draft_data/") else []
+        available_files = os.listdir("/checkpoints/draft_data_pqa/") if os.path.exists("/checkpoints/draft_data_pqa/") else []
         raise FileNotFoundError(
             f"Training data file not found: {data_json_path}\n"
-            f"Available files in /checkpoints/draft_data/: {available_files[:20]}"
+            f"Available files in /checkpoints/draft_data_pqa/: {available_files[:20]}"
         )
     
     print(f"Loading training data from: {data_json_path}")
@@ -100,7 +102,7 @@ def train_draft_model(
     # Check validation data if provided
     val_json_path = None
     if val_json_filename:
-        val_json_path = f"/checkpoints/draft_data/{val_json_filename}"
+        val_json_path = f"/checkpoints/draft_data_pqa/{val_json_filename}"
         if not os.path.exists(val_json_path):
             print(f"Warning: Validation data file not found: {val_json_path}")
             print("Continuing without validation...")
@@ -127,10 +129,12 @@ def train_draft_model(
         "lr": lr,
         "weight_decay": weight_decay,
         "num_workers": 4,
-        "ce_weight": ce_weight,
         "kl_weight": kl_weight,
         "cosine_weight": cosine_weight,
         "temperature": temperature,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "warmup_steps": warmup_steps,
+        "peak_lr": 4e-4,  # Cap LR after warmup (consistent with medium model)
         "use_wandb": True,
         "wandb_project": wandb_project,
         "wandb_run_name": wandb_run_name,
@@ -173,7 +177,6 @@ def train_draft_model_medium(
     num_epochs: int = 40,
     lr: float = 1e-3,
     weight_decay: float = 0.01,
-    ce_weight: float = 2.0,
     kl_weight: float = 1.0,
     cosine_weight: float = 0.5,
     temperature: float = 2.0,
@@ -194,7 +197,6 @@ def train_draft_model_medium(
         num_epochs: Number of training epochs
         lr: Learning rate (default: 1e-3)
         weight_decay: Weight decay for optimizer (L2 regularization)
-        ce_weight: Weight for causal LM (CrossEntropy) loss
         kl_weight: Weight for KL divergence loss
         cosine_weight: Weight for cosine similarity loss (latent thoughts) (default: 0.5, reduced from 1.0)
         temperature: Temperature for softmax in KL divergence (default: 2.0)
@@ -210,12 +212,12 @@ def train_draft_model_medium(
     
     # Base directory in gpt2-medium volume
     base_dir = "/checkpoints/gpt2medium-prontoqa-checkpoints"
-    draft_data_dir = f"{base_dir}/draft_data"
+    draft_data_dir = f"{base_dir}/draft_data_pqa"
     
     # Paths in Modal volume
     data_json_path = f"{draft_data_dir}/{data_json_filename}"
     val_json_path = f"{draft_data_dir}/{val_json_filename}"
-    save_path = f"{base_dir}/draft_checkpoints"
+    save_path = f"{base_dir}/draft_model_final"
     
     os.makedirs(save_path, exist_ok=True)
     
@@ -258,7 +260,6 @@ def train_draft_model_medium(
         "weight_decay": weight_decay,
         "peak_lr": 4e-4,
         "num_workers": 4,
-        "ce_weight": ce_weight,
         "kl_weight": kl_weight,
         "cosine_weight": cosine_weight,
         "temperature": temperature,
@@ -299,35 +300,37 @@ def main():
     print()
     print("Usage:")
     print("  modal run modal_draft_training.py::train_draft_model \\")
-    print("    --data-json-filename 'draft_training_data.json' \\")
-    print("    --val-json-filename 'draft_validation_data.json' \\")
+    print("    --data-json-filename 'prontoqa_train_draft_training_data_standard.json' \\")
+    print("    --val-json-filename 'prontoqa_valid_draft_training_data_standard.json' \\")
     print("    --batch-size 32 \\")
-    print("    --num-epochs 10 \\")
+    print("    --num-epochs 40 \\")
     print("    --lr 0.001 \\")
     print("    --weight-decay 0.01 \\")
-    print("    --ce-weight 1.0 \\")
     print("    --kl-weight 1.0 \\")
-    print("    --cosine-weight 1.0 \\")
-    print("    --temperature 3.0 \\")
-    print("    --wandb-project 'draft-model-training'")
+    print("    --cosine-weight 0.5 \\")
+    print("    --temperature 2.0 \\")
+    print("    --gradient-accumulation-steps 4 \\")
+    print("    --warmup-steps 20 \\")
+    print("    --wandb-project 'draft-model-training-prontoqa-standard'")
     print()
     print("Default parameters:")
-    print("  - data_json_filename: 'draft_training_data.json'")
-    print("  - val_json_filename: None (optional, enable validation if provided)")
-    print("  - batch_size: 32 (per GPU, effective: 64 with 2 GPUs)")
+    print("  - data_json_filename: 'prontoqa_train_draft_training_data_standard.json'")
+    print("  - val_json_filename: 'prontoqa_valid_draft_training_data_standard.json'")
+    print("  - batch_size: 32 (per GPU, effective: 128 with 4 GPUs)")
     print("  - num_epochs: 10")
-    print("  - lr: 1e-4 (recommended: 1e-3)")
+    print("  - lr: 1e-4")
     print("  - weight_decay: 0.01")
-    print("  - ce_weight: 1.0 (causal LM loss weight)")
     print("  - kl_weight: 1.0 (KL divergence loss weight)")
     print("  - cosine_weight: 1.0 (cosine similarity loss weight for latent thoughts)")
-    print("  - temperature: 1.0 (recommended: 3.0 for KL divergence)")
+    print("  - temperature: 1.0")
+    print("  - gradient_accumulation_steps: 4 (accumulate gradients over 4 batches before updating)")
+    print("  - warmup_steps: 20 (linear warmup for learning rate, then exponential decay per step)")
     print("  - wandb_project: 'draft-model-training'")
     print()
     print("Note: Validation runs after each epoch and logs metrics to WandB.")
     print()
-    print("Note: Training uses 2 GPUs with torchrun for distributed training.")
-    print("      Batch size is per GPU, so effective batch size = batch_size * 2")
+    print("Note: Training uses 4 GPUs with torchrun for distributed training.")
+    print("      Batch size is per GPU, so effective batch size = batch_size * 4")
     print()
     print("=" * 60)
     print("GPT2-MEDIUM PRONTOQA TRAINING:")
@@ -340,7 +343,6 @@ def main():
     print("    --num-epochs 20 \\")
     print("    --lr 0.001 \\")
     print("    --weight-decay 0.01 \\")
-    print("    --ce-weight 1.0 \\")
     print("    --kl-weight 1.0 \\")
     print("    --cosine-weight 1.0 \\")
     print("    --temperature 3.0 \\")
@@ -353,7 +355,7 @@ def main():
     print("  - num_epochs: 10")
     print("  - lr: 1e-3 (recommended)")
     print("  - weight_decay: 0.01")
-    print("  - ce_weight: 2.0 (causal LM loss weight)")
+    print("")
     print("  - kl_weight: 1.0 (KL divergence loss weight)")
     print("  - cosine_weight: 0.5 (cosine similarity loss weight for latent thoughts, reduced)")
     print("  - temperature: 2.0 (for KL divergence)")
@@ -361,6 +363,7 @@ def main():
     print("  - warmup_steps: 20 (linear warmup for learning rate, then exponential decay per step)")
     print("  - wandb_project: 'draft-model-training-prontoqa-medium'")
     print()
-    print("Note: Checkpoints saved to /checkpoints/gpt2medium-prontoqa-checkpoints/draft_checkpoints/")
+    print("Note: Checkpoints saved to /checkpoints/draft_model_final/ (standard) or")
+    print("      /checkpoints/gpt2medium-prontoqa-checkpoints/draft_model_final/ (medium)")
     print("Note: Validation runs after each epoch and logs metrics to WandB.")
 

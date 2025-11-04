@@ -222,7 +222,9 @@ def main():
     max_latent_stage = configs.max_latent_stage
     c_thought = configs.c_thought
     
-    output_dir = os.path.join(configs.save_path, "draft_data")
+    # Use custom output_dir if provided, otherwise default to "draft_data"
+    output_subdir = getattr(configs, "output_dir", "draft_data")
+    output_dir = os.path.join(configs.save_path, output_subdir)
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_filename)
     
