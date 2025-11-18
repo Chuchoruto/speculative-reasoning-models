@@ -57,6 +57,7 @@ def train_draft_model(
     warmup_steps: int = 20,
     wandb_project: str = "draft-model-training",
     wandb_run_name: str = None,
+    save_path: str = None,
 ):
     """
     Train draft model using data from Modal volume.
@@ -75,6 +76,7 @@ def train_draft_model(
         warmup_steps: Number of warmup steps for learning rate (default: 20)
         wandb_project: WandB project name
         wandb_run_name: WandB run name (auto-generated if None)
+        save_path: Path to save checkpoints (default: /checkpoints/draft_model_final)
     """
     import subprocess
     import datetime
@@ -84,7 +86,8 @@ def train_draft_model(
     # Paths in Modal volume
     data_json_path = f"/checkpoints/draft_data_pqa/{data_json_filename}"
     data_dir = "/checkpoints/draft_data_pqa"  # Directory with NPZ files
-    save_path = "/checkpoints/draft_model_final"
+    if save_path is None:
+        save_path = "/checkpoints/draft_model_final"
     
     os.makedirs(save_path, exist_ok=True)
     
@@ -184,6 +187,7 @@ def train_draft_model_medium(
     warmup_steps: int = 20,
     wandb_project: str = "draft-model-training-prontoqa-medium",
     wandb_run_name: str = None,
+    save_path: str = None,
 ):
     """
     Train draft model using gpt2-medium ProntoQA Coconut data from Modal volume.
@@ -204,6 +208,7 @@ def train_draft_model_medium(
         warmup_steps: Number of warmup steps for learning rate (default: 20)
         wandb_project: WandB project name
         wandb_run_name: WandB run name (auto-generated if None)
+        save_path: Path to save checkpoints (default: /checkpoints/gpt2medium-prontoqa-checkpoints/draft_model_final)
     """
     import subprocess
     import datetime
@@ -217,7 +222,8 @@ def train_draft_model_medium(
     # Paths in Modal volume
     data_json_path = f"{draft_data_dir}/{data_json_filename}"
     val_json_path = f"{draft_data_dir}/{val_json_filename}"
-    save_path = f"{base_dir}/draft_model_final"
+    if save_path is None:
+        save_path = f"{base_dir}/draft_model_final"
     
     os.makedirs(save_path, exist_ok=True)
     
@@ -326,11 +332,15 @@ def main():
     print("  - gradient_accumulation_steps: 4 (accumulate gradients over 4 batches before updating)")
     print("  - warmup_steps: 20 (linear warmup for learning rate, then exponential decay per step)")
     print("  - wandb_project: 'draft-model-training'")
+    print("  - save_path: '/checkpoints/draft_model_final' (path to save checkpoints)")
     print()
     print("Note: Validation runs after each epoch and logs metrics to WandB.")
     print()
     print("Note: Training uses 4 GPUs with torchrun for distributed training.")
     print("      Batch size is per GPU, so effective batch size = batch_size * 4")
+    print()
+    print("Note: Use --save-path to specify a different checkpoint directory (e.g., for reverse KL model):")
+    print("      --save-path '/checkpoints/draft_model_reverse_kl'")
     print()
     print("=" * 60)
     print("GPT2-MEDIUM PRONTOQA TRAINING:")
@@ -362,8 +372,10 @@ def main():
     print("  - gradient_accumulation_steps: 4 (accumulate gradients over 4 batches before updating)")
     print("  - warmup_steps: 20 (linear warmup for learning rate, then exponential decay per step)")
     print("  - wandb_project: 'draft-model-training-prontoqa-medium'")
+    print("  - save_path: '/checkpoints/gpt2medium-prontoqa-checkpoints/draft_model_final' (path to save checkpoints)")
     print()
     print("Note: Checkpoints saved to /checkpoints/draft_model_final/ (standard) or")
     print("      /checkpoints/gpt2medium-prontoqa-checkpoints/draft_model_final/ (medium)")
+    print("      Use --save-path to specify a different checkpoint directory (e.g., for reverse KL model)")
     print("Note: Validation runs after each epoch and logs metrics to WandB.")
 
