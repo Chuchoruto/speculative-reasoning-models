@@ -82,18 +82,18 @@ def compute_loss(
         teacher_logits_aligned = teacher_logits_sample[:min_len]  # [min_len, vocab]
         
         # Apply temperature scaling
-        student_log_probs = F.log_softmax(student_logits_aligned / temperature, dim=-1)
-        teacher_probs = F.softmax(teacher_logits_aligned / temperature, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits_aligned / temperature, dim=-1)
+        student_probs = F.softmax(student_logits_aligned / temperature, dim=-1)
         
-        # KL divergence: KL(student || teacher)
+        # KL divergence: KL(student logits || teacher logits) - reverse KL
         kl_loss = F.kl_div(
-            student_log_probs,
-            teacher_probs,
+            teacher_log_probs,
+            student_probs,
             reduction='batchmean',
             log_target=False
         )
         
-        total_kl_loss += kl_loss
+        total_kl_loss += (kl_loss * (temperature ** 2))
         num_kl_samples += 1
         
         # Cosine similarity loss for latent thoughts
@@ -674,16 +674,16 @@ def main():
     lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     
     # Additional scheduler: Reduce on plateau for CE loss (optional, for extra safety)
-    plateau_scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,  # Reduce LR by half when plateau detected
-        patience=2,  # Wait 2 epochs without improvement before reducing
-        verbose=True,  # Print LR reduction messages
-        min_lr=1e-6,  # Minimum learning rate
-        threshold=0.03,  # Require at least 3% relative improvement to count as progress
-        threshold_mode='rel',  # Relative threshold mode
-    )
+    #plateau_scheduler = ReduceLROnPlateau(
+        #optimizer,
+        #mode='min',
+        #factor=0.5,  # Reduce LR by half when plateau detected
+        #patience=2,  # Wait 2 epochs without improvement before reducing
+        #verbose=True,  # Print LR reduction messages
+        #min_lr=1e-6,  # Minimum learning rate
+        #threshold=0.03,  # Require at least 3% relative improvement to count as progress
+        #threshold_mode='rel',  # Relative threshold mode
+    #)
     
     kl_weight = config.get('kl_weight', 1.0)
     cosine_weight = config.get('cosine_weight', 1.0)
@@ -779,7 +779,7 @@ def main():
             
             # Use validation KL loss if available, otherwise training KL loss
             kl_loss_for_scheduler = val_metrics['avg_kl'] if val_metrics is not None else train_metrics['avg_kl']
-            plateau_scheduler.step(kl_loss_for_scheduler)
+            #plateau_scheduler.step(kl_loss_for_scheduler)
             
             current_lr = optimizer.param_groups[0]['lr']
             if wandb_run is not None:
