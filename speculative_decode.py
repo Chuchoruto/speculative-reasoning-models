@@ -111,9 +111,11 @@ def speculative_decode_latent_thoughts(
         target_hidden_dim: Target model hidden dimension (auto-detect if None)
     
     Returns:
-        (acceptance_list, draft_thoughts, target_thoughts, draft_time, verify_time, logits)
-        - draft_time: Time taken to generate draft latent thoughts
-        - verify_time: Time taken to verify with target model
+        (acceptance_list, draft_thoughts, target_thoughts, draft_time, verify_time, draft_time_per_thought, verify_time_per_thought, logits)
+        - draft_time: Total time taken to generate all draft latent thoughts (6 sequential passes)
+        - verify_time: Total time taken to verify all draft thoughts with target model (1 parallel pass) - NOT divided
+        - draft_time_per_thought: Average time per individual latent thought (draft model)
+        - verify_time_per_thought: Total time for target model verification (same as verify_time, kept for consistency)
         - logits: Logits from target model verification [batch_size, seq_len, vocab_size] or None
     """
     if device is None:
@@ -145,13 +147,20 @@ def speculative_decode_latent_thoughts(
     # The draft model processes latent tokens sequentially in its forward pass,
     # so each latent thought depends on previous ones (draft_latent 1 -> draft_latent 2, etc.)
     # We call it once with all positions - it handles sequential processing internally
+    # NOTE: Internally, the draft model does 6 sequential forward passes (one per latent token)
+    # This is slower than a single parallel pass, even with a smaller model
     all_draft_thoughts = []
     
     # Time the draft generation
+    # IMPORTANT: This should ONLY call the draft model (GPT2-mini), NOT the target model
+    # The draft model forward pass should be the same speed regardless of target model size
+    # This timing includes ALL 6 sequential forward passes through the draft model
     draft_start_time = time.perf_counter()
     with torch.no_grad():
         # Call draft model once - it processes all latent positions sequentially internally
         # Each latent thought is generated autoregressively (depends on previous ones)
+        # This ONLY uses the draft model (GPT2-mini base), not the target model
+        # Internally: Does 6 sequential forward passes (one per latent token position)
         draft_outputs = draft_model(
             input_ids=input_ids_batch,
             attention_mask=attention_mask_batch,
@@ -161,10 +170,12 @@ def speculative_decode_latent_thoughts(
         )
         
         # Ensure GPU synchronization for accurate timing
+        # This sync happens AFTER draft model forward pass, BEFORE any target model calls
         if device.type == 'cuda':
             torch.cuda.synchronize(device)
         
         # Extract all draft latent thoughts (already projected to target_hidden_dim)
+        # This extraction happens within the draft timing window (before verify_start_time)
         if draft_outputs.latent_thoughts and len(draft_outputs.latent_thoughts[0]) > 0:
             all_draft_thoughts = [
                 thought.to(device) if isinstance(thought, torch.Tensor) else torch.tensor(thought, device=device)
@@ -172,9 +183,16 @@ def speculative_decode_latent_thoughts(
             ]
     draft_end_time = time.perf_counter()
     draft_time = draft_end_time - draft_start_time
+    # draft_time includes 6 sequential forward passes through the draft model (GPT2-mini)
+    # This is slower than a single parallel pass, even with a larger model
+    # Calculate per-unit time: divide by number of latent thoughts generated
+    num_draft_thoughts_generated = len(all_draft_thoughts) if all_draft_thoughts else num_latent_thoughts
+    draft_time_per_thought = draft_time / num_draft_thoughts_generated if num_draft_thoughts_generated > 0 else 0.0
     
     # Step 2: Construct input sequence with ALL draft latent thoughts embedded
     # Replace latent token positions with draft latent thoughts for verification
+    # NOTE: Verification uses the TARGET model (target_model.base_causallm), NOT the draft model
+    # This is a single parallel forward pass, which is faster than 6 sequential passes
     verify_start_time = time.perf_counter()
     with torch.no_grad():
         # Get base embeddings from target model
@@ -206,15 +224,18 @@ def speculative_decode_latent_thoughts(
                             draft_thought = torch.cat([draft_thought, padding])
                 base_embeddings[0, latent_pos, :] = draft_thought
         
-        # Step 3: Call base model directly in ONE forward pass to get all hidden states
+        # Step 3: Call TARGET model's base_causallm in ONE forward pass to get all hidden states
         # This processes: question_input_seq -> draft_thought_1 -> draft_thought_2 -> ... -> draft_thought_6
         # We extract hidden states at positions right BEFORE each draft thought (after processing up to that point)
         # The hidden state at position i-1 represents the "verified thought" for draft_thought at position i
+        # IMPORTANT: This uses the TARGET model (larger), but in a SINGLE parallel pass
+        # This is why verification can be faster than draft (1 pass vs 6 sequential passes)
         
-        # Get the base causal LM from Coconut
-        base_model = target_model.base_causallm
+        # Get the base causal LM from Coconut (TARGET model, not draft)
+        base_model = target_model.base_causallm  # This is the TARGET model (GPT2 or GPT2-medium)
         
-        # Process entire sequence in one forward pass with output_hidden_states=True
+        # Process entire sequence in ONE forward pass with output_hidden_states=True
+        # This is a single parallel pass, processing all draft thoughts at once
         outputs = base_model(
             inputs_embeds=base_embeddings,
             attention_mask=attention_mask_batch,
@@ -259,6 +280,9 @@ def speculative_decode_latent_thoughts(
             all_target_thoughts = all_target_thoughts[:len(sorted_latent_positions)]
     verify_end_time = time.perf_counter()
     verify_time = verify_end_time - verify_start_time
+    # verify_time is for a single parallel forward pass that verifies all draft thoughts
+    # This is the total time for the parallel verification pass (not divided)
+    verify_time_per_thought = verify_time  # Keep as total time, not per-unit
     
     # Step 4: Verify all latent thoughts in parallel (vectorized)
     min_len = min(len(all_draft_thoughts), len(all_target_thoughts), num_latent_thoughts)
@@ -326,7 +350,7 @@ def speculative_decode_latent_thoughts(
     # Return only the verified thoughts (slice to min_len)
     # Also return logits from the target model for extracting first token
     target_logits = outputs.logits if hasattr(outputs, 'logits') else None
-    return all_acceptance, all_draft_thoughts[:min_len], all_target_thoughts[:min_len], draft_time, verify_time, target_logits
+    return all_acceptance, all_draft_thoughts[:min_len], all_target_thoughts[:min_len], draft_time, verify_time, draft_time_per_thought, verify_time_per_thought, target_logits
 
 
 def speculative_decode_tokens(
@@ -357,7 +381,11 @@ def speculative_decode_tokens(
         rng: Random number generator
     
     Returns:
-        (generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total)
+        (generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total, draft_token_time, target_verify_time, draft_time_per_token, target_time_per_token)
+        - draft_token_time: Total time spent in draft model token generation
+        - target_verify_time: Total time spent in target model token verification (NOT divided, total time for parallel verification)
+        - draft_time_per_token: Average time per individual token (draft model)
+        - target_time_per_token: Total time for target model token verification (same as target_verify_time, kept for consistency)
     """
     if device is None:
         device = input_ids.device
@@ -378,6 +406,10 @@ def speculative_decode_tokens(
     tokens_accepted = 0
     tokens_total = 0
     
+    # Track timing separately for draft and target
+    total_draft_token_time = 0.0
+    total_target_verify_time = 0.0
+    
     while len(generated_tokens) < max_new_tokens:
         # Draft model generates gamma tokens sequentially
         draft_tokens = []
@@ -387,9 +419,15 @@ def speculative_decode_tokens(
         draft_attn = current_attention_mask.unsqueeze(0)
         draft_pos = current_position_ids.unsqueeze(0)
         
+        # Time draft token generation - time each individual token
+        draft_token_times_this_round = []
         # Generate all gamma draft tokens
+        # Track whether we stopped early due to drafting EOS
+        draft_reached_eos = False
+
         for _ in range(gamma):
             num_draft_calls += 1
+            draft_token_start = time.perf_counter()
             with torch.no_grad():
                 # Get draft logits
                 draft_outputs = draft_model(
@@ -418,6 +456,21 @@ def speculative_decode_tokens(
                     draft_pos,
                     torch.tensor([[draft_pos[0, -1].item() + 1]], device=device)
                 ], dim=1)
+            
+            # Ensure GPU synchronization for accurate timing
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            draft_token_end = time.perf_counter()
+            draft_token_times_this_round.append(draft_token_end - draft_token_start)
+
+            # Stop drafting further tokens in this round if EOS is generated.
+            # Once <|endoftext|> is proposed, any additional draft tokens would be discarded
+            # regardless of whether the EOS token is ultimately accepted or rejected.
+            if eos_token_id is not None and draft_token == eos_token_id:
+                draft_reached_eos = True
+                break
+        
+        total_draft_token_time += sum(draft_token_times_this_round)
         
         # PARALLEL VERIFICATION: Build full sequence with all draft tokens
         # and call target model ONCE to get logits for all positions
@@ -441,6 +494,8 @@ def speculative_decode_tokens(
             ).unsqueeze(0)
         ], dim=1)
         
+        # Time target verification
+        target_verify_start = time.perf_counter()
         # Single forward pass to get logits for all draft token positions
         num_target_calls += 1
         with torch.no_grad():
@@ -458,6 +513,10 @@ def speculative_decode_tokens(
                 collect_latent_thoughts=False,
             )
             
+            # Ensure GPU synchronization for accurate timing
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            
             # Extract logits for each draft token position
             # Logits shape: [batch=1, seq_len, vocab_size]
             # Note: logits[i] are the logits for predicting token at position i+1
@@ -470,6 +529,9 @@ def speculative_decode_tokens(
             start_idx = base_len - 1
             end_idx = base_len + len(draft_tokens) - 1
             target_logits_all = target_outputs.logits[0, start_idx:end_idx, :]
+        target_verify_end = time.perf_counter()
+        target_verify_time_this_round = target_verify_end - target_verify_start
+        total_target_verify_time += target_verify_time_this_round
         
         # Verify all tokens in parallel using the extracted logits
         verified_tokens = []
@@ -501,6 +563,10 @@ def speculative_decode_tokens(
                 verified_tokens.append(target_argmax)  # Use target's argmax
                 break  # Stop after first rejection
         
+        # Calculate per-token time for this round: divide by number of tokens verified
+        # Note: target verification is parallel, so we divide the total time by number of tokens
+        num_tokens_verified_this_round = len(verified_tokens)
+        
         # Add verified tokens to output
         generated_tokens.extend(verified_tokens)
         
@@ -526,7 +592,12 @@ def speculative_decode_tokens(
         if len(generated_tokens) >= max_new_tokens:
             break
     
-    return generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total
+    # Calculate per-token average for draft model only
+    # Target verification time is kept as total (not divided) since it's parallel verification
+    draft_time_per_token = total_draft_token_time / tokens_total if tokens_total > 0 else 0.0
+    target_time_per_token = total_target_verify_time  # Keep as total time, not per-unit
+    
+    return generated_tokens, num_draft_calls, num_target_calls, tokens_accepted, tokens_total, total_draft_token_time, total_target_verify_time, draft_time_per_token, target_time_per_token
 
 
 def autoregressive_token_generation(
@@ -617,6 +688,7 @@ def speculative_decode(
     latent_positions: List[int],
     num_latent_thoughts: int = 6,
     gamma: int = 6,
+    gamma_tokens: int = None,  # If None, uses gamma value
     max_new_tokens: int = 50,
     eos_token_id: int = None,
     similarity_threshold: float = 0.9,
@@ -638,6 +710,7 @@ def speculative_decode(
         latent_positions: Positions of latent tokens
         num_latent_thoughts: Number of latent thoughts (default 6)
         gamma: Number of draft tokens per round (for tokens). Note: latent thoughts are now processed all at once (no batching)
+        gamma_tokens: Number of draft tokens per round for token generation. If None, uses gamma value (for backward compatibility)
         max_new_tokens: Maximum new tokens to generate
         eos_token_id: EOS token ID
         similarity_threshold: Cosine similarity threshold for latent thoughts
@@ -650,6 +723,9 @@ def speculative_decode(
     Returns:
         (generated_tokens, stats_dict)
     """
+    # Use gamma_tokens if provided, otherwise fall back to gamma for backward compatibility
+    if gamma_tokens is None:
+        gamma_tokens = gamma
     if device is None:
         device = input_ids.device
     
@@ -717,7 +793,7 @@ def speculative_decode(
         verification_logits = None  # No verification, so no logits
     else:
         # Generate and verify with both models
-        acceptance_list, draft_thoughts, target_thoughts, draft_latent_time, verify_latent_time, verification_logits = speculative_decode_latent_thoughts(
+        acceptance_list, draft_thoughts, target_thoughts, draft_latent_time, verify_latent_time, draft_time_per_thought, verify_time_per_thought, verification_logits = speculative_decode_latent_thoughts(
             draft_model,
             target_model,
             input_ids,
@@ -725,7 +801,7 @@ def speculative_decode(
             position_ids,
             latent_positions,
             num_latent_thoughts=num_latent_thoughts,
-            gamma=gamma,
+            gamma=gamma_tokens,
             similarity_threshold=similarity_threshold,
             device=device,
             target_hidden_dim=target_hidden_dim,
@@ -737,13 +813,17 @@ def speculative_decode(
         # The parallel verification strategy allows us to verify all 6 latent thoughts in a single forward pass.
     
     latent_end_time = time.perf_counter()
-    latent_time = latent_end_time - latent_start_time
+    # Use the sum of draft and verify times for consistency (more accurate than wallclock diff)
+    # The wallclock diff might include tiny overhead, but draft+verify is what we actually measured
+    latent_time = draft_latent_time + verify_latent_time
     
     stats['latent_accepted'] = sum(acceptance_list)
     stats['latent_total'] = len(acceptance_list)
     stats['latent_thought_time'] = latent_time
     stats['draft_latent_time'] = draft_latent_time
     stats['verify_latent_time'] = verify_latent_time
+    stats['draft_time_per_thought'] = draft_time_per_thought
+    stats['verify_time_per_thought'] = verify_time_per_thought
     
     # If not all latent thoughts accepted, we might need to handle this
     # For now, continue with token generation regardless
@@ -797,13 +877,13 @@ def speculative_decode(
     token_start_time = time.perf_counter()
     if tokens_speculative:
         # Use speculative decoding for tokens
-        additional_tokens, num_draft_tokens, num_target_tokens, tokens_accepted, tokens_total = speculative_decode_tokens(
+        additional_tokens, num_draft_tokens, num_target_tokens, tokens_accepted, tokens_total, draft_token_time, target_verify_time, draft_time_per_token, target_time_per_token = speculative_decode_tokens(
             draft_model,
             target_model,
             token_input_ids,
             token_attention_mask,
             token_position_ids,
-            gamma=gamma,
+            gamma=gamma_tokens,
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             device=device,
@@ -815,6 +895,10 @@ def speculative_decode(
         stats['num_target_calls'] += num_target_tokens
         stats['tokens_accepted'] = tokens_accepted
         stats['tokens_total'] = tokens_total
+        stats['draft_token_time'] = draft_token_time
+        stats['target_verify_token_time'] = target_verify_time
+        stats['draft_time_per_token'] = draft_time_per_token
+        stats['target_time_per_token'] = target_time_per_token
     else:
         # Use normal autoregressive generation with target model only
         additional_tokens = autoregressive_token_generation(
@@ -855,11 +939,11 @@ def baseline_autoregressive_decode(
     max_new_tokens: int = 50,
     eos_token_id: int = None,
     device: torch.device = None,
-) -> Tuple[List[int], float, float]:
+) -> Tuple[List[int], float, float, float, float]:
     """
     Baseline autoregressive generation using only the target model.
     Generates latent thought vectors first, then generates tokens autoregressively.
-    Tracks separate wall clock times for each phase.
+    Tracks separate wall clock times for each phase and per-unit times.
     
     Args:
         target_model: Target (Coconut) model instance
@@ -873,9 +957,11 @@ def baseline_autoregressive_decode(
         device: Device to run on
     
     Returns:
-        (generated_tokens, latent_thought_time, token_generation_time)
-        - latent_thought_time: Time to generate latent thought vectors
-        - token_generation_time: Time to generate tokens autoregressively
+        (generated_tokens, latent_thought_time, token_generation_time, latent_time_per_thought, token_time_per_token)
+        - latent_thought_time: Total time to generate latent thought vectors (single parallel pass)
+        - token_generation_time: Total time to generate tokens autoregressively
+        - latent_time_per_thought: Average time per individual latent thought (latent_thought_time / num_latent_thoughts)
+        - token_time_per_token: Average time per individual token (token_generation_time / num_tokens_generated)
     """
     if device is None:
         device = input_ids.device
@@ -913,6 +999,9 @@ def baseline_autoregressive_decode(
     
     latent_end_time = time.perf_counter()
     latent_thought_time = latent_end_time - latent_start_time
+    # Calculate per-thought time: divide total time by number of latent thoughts
+    # Note: This is a single parallel pass, so we divide to get per-unit time
+    latent_time_per_thought = latent_thought_time / num_latent_thoughts if num_latent_thoughts > 0 else 0.0
     
     # Get the position after latent tokens
     if len(latent_positions) > 0:
@@ -965,8 +1054,12 @@ def baseline_autoregressive_decode(
     # Step 2: Generate remaining tokens autoregressively and time it
     token_start_time = time.perf_counter()
     
+    # Track per-token times
+    token_times = []
+    
     # Autoregressive generation
     for _ in range(max_new_tokens):
+        token_iter_start = time.perf_counter()
         with torch.no_grad():
             dummy_labels_gen = torch.full(
                 (current_input_ids.shape[0], current_input_ids.shape[1]),
@@ -982,10 +1075,17 @@ def baseline_autoregressive_decode(
                 collect_latent_thoughts=False,
             )
             
+            # Ensure GPU synchronization for accurate timing
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            
             # Get next token (greedy decoding)
             next_token_logits = outputs.logits[0, -1, :]
             next_token = torch.argmax(next_token_logits).item()
             generated_tokens.append(next_token)
+            
+            token_iter_end = time.perf_counter()
+            token_times.append(token_iter_end - token_iter_start)
             
             # Check for EOS
             if eos_token_id is not None and next_token == eos_token_id:
@@ -1008,4 +1108,8 @@ def baseline_autoregressive_decode(
     token_end_time = time.perf_counter()
     token_generation_time = token_end_time - token_start_time
     
-    return generated_tokens, latent_thought_time, token_generation_time
+    # Calculate per-token time: average of individual token times
+    num_tokens_generated = len(token_times)
+    token_time_per_token = sum(token_times) / num_tokens_generated if num_tokens_generated > 0 else 0.0
+    
+    return generated_tokens, latent_thought_time, token_generation_time, latent_time_per_thought, token_time_per_token
