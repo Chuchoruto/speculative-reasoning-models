@@ -4,7 +4,7 @@ import argparse
 
 app = modal.App("coconut-download")
 
-image = modal.Image.debian_slim().pip_install(["modal"])
+image = modal.Image.debian_slim().pip_install(["modal", "torch"])
 
 # Use the same volumes as the training scripts
 checkpoint_volume = modal.Volume.from_name("coconut-checkpoints", create_if_missing=True)
@@ -288,6 +288,162 @@ def list_checkpoints_in_path_medium(path: str = "/checkpoints/gpt2medium-prontoq
 
 @app.function(
     image=image,
+    volumes={"/checkpoints": checkpoint_volume_medium},
+    timeout=60 * 60 * 1
+)
+def inspect_draft_model_checkpoint(checkpoint_path: str):
+    """Inspect a draft model checkpoint to show base model and configuration."""
+    import torch
+    import os
+    
+    print(f"🔍 Inspecting draft model checkpoint: {checkpoint_path}")
+    print("=" * 50)
+    
+    try:
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ Checkpoint not found: {checkpoint_path}")
+            return False
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        
+        # Extract config if available
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            print("📋 Configuration:")
+            print(f"   Model ID: {config.get('model_id', 'Not specified')}")
+            print(f"   Teacher Hidden Dim: {config.get('teacher_hidden_dim', 'Not specified')}")
+            print(f"   Save Path: {config.get('save_path', 'Not specified')}")
+            if 'loss_type' in config:
+                print(f"   Loss Type: {config.get('loss_type', 'cosine')}")
+        else:
+            print("⚠️  No config found in checkpoint")
+        
+        # Check model state dict keys to infer structure
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print("\n📦 Model Structure:")
+            
+            # Check for base model keys
+            base_model_keys = [k for k in state_dict.keys() if 'base_model' in k]
+            if base_model_keys:
+                print(f"   Found {len(base_model_keys)} base_model keys")
+                # Show first few keys as examples
+                print(f"   Example keys: {base_model_keys[:3]}")
+            
+            # Check for projection layer
+            projection_keys = [k for k in state_dict.keys() if 'latent_projection' in k]
+            if projection_keys:
+                print(f"   Found projection layer: {projection_keys}")
+                # Try to infer dimensions from weight shape
+                if 'latent_projection.weight' in state_dict:
+                    weight_shape = state_dict['latent_projection.weight'].shape
+                    print(f"   Projection layer shape: {weight_shape}")
+                    if len(weight_shape) == 2:
+                        print(f"   Projection: {weight_shape[1]} -> {weight_shape[0]} dims")
+            
+            # Check epoch
+            if 'epoch' in checkpoint:
+                print(f"\n📅 Training Info:")
+                print(f"   Epoch: {checkpoint['epoch']}")
+        
+        # Check if it's a simple state dict (no wrapper)
+        elif isinstance(checkpoint, dict) and any('transformer' in k or 'base_model' in k for k in checkpoint.keys()):
+            print("\n📦 Model Structure:")
+            print("   Checkpoint appears to be a direct state dict")
+            # Try to infer from key names
+            if any('latent_projection' in k for k in checkpoint.keys()):
+                print("   Contains projection layer")
+        
+        print("\n✅ Checkpoint inspection complete")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error inspecting checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=60 * 60 * 1
+)
+def inspect_draft_model_checkpoint_standard(checkpoint_path: str):
+    """Inspect a draft model checkpoint to show base model and configuration (standard volume)."""
+    import torch
+    import os
+    
+    print(f"🔍 Inspecting draft model checkpoint: {checkpoint_path}")
+    print("=" * 50)
+    
+    try:
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ Checkpoint not found: {checkpoint_path}")
+            return False
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        
+        # Extract config if available
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            print("📋 Configuration:")
+            print(f"   Model ID: {config.get('model_id', 'Not specified')}")
+            print(f"   Teacher Hidden Dim: {config.get('teacher_hidden_dim', 'Not specified')}")
+            print(f"   Save Path: {config.get('save_path', 'Not specified')}")
+            if 'loss_type' in config:
+                print(f"   Loss Type: {config.get('loss_type', 'cosine')}")
+        else:
+            print("⚠️  No config found in checkpoint")
+        
+        # Check model state dict keys to infer structure
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print("\n📦 Model Structure:")
+            
+            # Check for base model keys
+            base_model_keys = [k for k in state_dict.keys() if 'base_model' in k]
+            if base_model_keys:
+                print(f"   Found {len(base_model_keys)} base_model keys")
+                # Show first few keys as examples
+                print(f"   Example keys: {base_model_keys[:3]}")
+            
+            # Check for projection layer
+            projection_keys = [k for k in state_dict.keys() if 'latent_projection' in k]
+            if projection_keys:
+                print(f"   Found projection layer: {projection_keys}")
+                # Try to infer dimensions from weight shape
+                if 'latent_projection.weight' in state_dict:
+                    weight_shape = state_dict['latent_projection.weight'].shape
+                    print(f"   Projection layer shape: {weight_shape}")
+                    if len(weight_shape) == 2:
+                        print(f"   Projection: {weight_shape[1]} -> {weight_shape[0]} dims")
+            
+            # Check epoch
+            if 'epoch' in checkpoint:
+                print(f"\n📅 Training Info:")
+                print(f"   Epoch: {checkpoint['epoch']}")
+        
+        # Check if it's a simple state dict (no wrapper)
+        elif isinstance(checkpoint, dict) and any('transformer' in k or 'base_model' in k for k in checkpoint.keys()):
+            print("\n📦 Model Structure:")
+            print("   Checkpoint appears to be a direct state dict")
+            # Try to infer from key names
+            if any('latent_projection' in k for k in checkpoint.keys()):
+                print("   Contains projection layer")
+        
+        print("\n✅ Checkpoint inspection complete")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error inspecting checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+@app.function(
+    image=image,
     volumes={"/checkpoints": checkpoint_volume},
     timeout=60 * 60 * 1
 )
@@ -334,6 +490,41 @@ def download_latest_checkpoint(model_type: str, local_path: str = "./downloaded_
     volumes={"/checkpoints": checkpoint_volume},
     timeout=60 * 60 * 1
 )
+def download_output_comparison():
+    """Read and return the output comparison JSON file content from speculative decoding evaluation"""
+    import json
+    import os
+    
+    source_path = "/checkpoints/output_verification/output_comparison.json"
+    
+    try:
+        if os.path.exists(source_path):
+            with open(source_path, 'r') as f:
+                data = json.load(f)
+            print(f"✅ Successfully read output comparison file")
+            print(f"   Total samples: {len(data)}")
+            print(f"\n📋 To download, use Modal CLI:")
+            print(f"   modal volume get coconut-checkpoints /checkpoints/output_verification .")
+            print(f"\n   Or download the entire /checkpoints directory:")
+            print(f"   modal volume get coconut-checkpoints /checkpoints ./downloaded_checkpoints/")
+            return data
+        else:
+            print(f"❌ File not found: {source_path}")
+            # List what's in the directory
+            output_dir = "/checkpoints/output_verification"
+            if os.path.exists(output_dir):
+                files = os.listdir(output_dir)
+                print(f"Available files in {output_dir}: {files}")
+            return None
+    except Exception as e:
+        print(f"❌ Error reading output comparison: {e}")
+        return None
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=60 * 60 * 1
+)
 def list_draft_training_data():
     """List all available draft training data files in the volume"""
     import os
@@ -344,6 +535,97 @@ def list_draft_training_data():
     
     try:
         draft_data_path = "/checkpoints/draft_data"
+        if os.path.exists(draft_data_path):
+            files = os.listdir(draft_data_path)
+            if files:
+                json_files = [f for f in files if f.endswith('.json')]
+                npz_files = [f for f in files if f.endswith('.npz')]
+                
+                print(f"📁 Draft Training Data:")
+                print(f"   Base volume path: {draft_data_path}")
+                print(f"   JSON metadata files: {len(json_files)}")
+                print(f"   NPZ vector files: {len(npz_files)}")
+                print()
+                
+                # List JSON files with details
+                if json_files:
+                    print("📄 JSON Metadata Files:")
+                    print("   Full volume paths:")
+                    for f in sorted(json_files):
+                        file_path = os.path.join(draft_data_path, f)
+                        full_volume_path = f"{draft_data_path}/{f}"
+                        try:
+                            size = os.path.getsize(file_path)
+                            size_mb = size / (1024 * 1024)
+                            # Count associated NPZ files
+                            base_name = f.replace('.json', '')
+                            npz_count = len(glob.glob(os.path.join(draft_data_path, f"{base_name}_sample_*.npz")))
+                            print(f"   - {full_volume_path}")
+                            print(f"     File: {f} ({size_mb:.2f} MB) → {npz_count} NPZ files")
+                        except:
+                            print(f"   - {full_volume_path}")
+                            print(f"     File: {f}")
+                
+                # Show summary of NPZ files
+                if npz_files:
+                    print()
+                    print("📦 NPZ Vector Files:")
+                    print(f"   Total: {len(npz_files)} files")
+                    print("   Full volume paths:")
+                    if len(npz_files) <= 20:
+                        # Show all if not too many
+                        for f in sorted(npz_files):
+                            file_path = os.path.join(draft_data_path, f)
+                            full_volume_path = f"{draft_data_path}/{f}"
+                            try:
+                                size = os.path.getsize(file_path)
+                                size_kb = size / 1024
+                                print(f"   - {full_volume_path} ({size_kb:.1f} KB)")
+                            except:
+                                print(f"   - {full_volume_path}")
+                    else:
+                        # Show first and last few
+                        for f in sorted(npz_files)[:5]:
+                            file_path = os.path.join(draft_data_path, f)
+                            full_volume_path = f"{draft_data_path}/{f}"
+                            try:
+                                size = os.path.getsize(file_path)
+                                size_kb = size / 1024
+                                print(f"   - {full_volume_path} ({size_kb:.1f} KB)")
+                            except:
+                                print(f"   - {full_volume_path}")
+                        print(f"   ... ({len(npz_files) - 10} more files) ...")
+                        for f in sorted(npz_files)[-5:]:
+                            file_path = os.path.join(draft_data_path, f)
+                            full_volume_path = f"{draft_data_path}/{f}"
+                            try:
+                                size = os.path.getsize(file_path)
+                                size_kb = size / 1024
+                                print(f"   - {full_volume_path} ({size_kb:.1f} KB)")
+                            except:
+                                print(f"   - {full_volume_path}")
+            else:
+                print("📁 Draft Training Data: None found")
+        else:
+            print("📁 Draft Training Data: Directory not found")
+    except Exception as e:
+        print(f"❌ Error listing draft training data: {e}")
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume_medium},
+    timeout=60 * 60 * 1
+)
+def list_draft_training_data_medium():
+    """List all available draft training data files in the gpt2-medium volume"""
+    import os
+    import glob
+    
+    print("🔍 Available draft training data files (gpt2-medium volume):")
+    print("=" * 50)
+    
+    try:
+        draft_data_path = "/checkpoints/gpt2medium-prontoqa-checkpoints/draft_data_pqa"
         if os.path.exists(draft_data_path):
             files = os.listdir(draft_data_path)
             if files:
@@ -446,7 +728,12 @@ def main():
     print("   modal run modal_download.py::download_all_checkpoints --local-path './my_checkpoints'")
     print()
     print("📊 Draft Training Data:")
-    print("   modal run modal_download.py::list_draft_training_data")
+    print("   modal run modal_download.py::list_draft_training_data  # Standard volume")
+    print("   modal run modal_download.py::list_draft_training_data_medium  # GPT2-medium volume")
+    print()
+    print("📥 Download Evaluation Results:")
+    print("   modal run modal_download.py::download_output_comparison  # Reads and verifies file exists")
+    print("   modal volume get coconut-checkpoints /checkpoints/output_verification .  # Download directory")
     print()
     print("   To download, use the local script (requires Modal CLI):")
     print("   python download_draft_data.py --filename 'draft_training_data.json' --local-path './my_checkpoints'")
