@@ -45,17 +45,18 @@ def _evaluate_speculative_decoding_impl(
     data_path: str,
     num_latent_thoughts: int,
     gamma: int,
-    max_new_tokens: int,
-    similarity_threshold: float,
-    max_samples: int,
-    clock_run_bool: bool,
-    record_output_bool: bool,
-    baseline_only_bool: bool,
-    tokens_speculative_bool: bool,
-    skip_latent_verification_bool: bool,
-    target_model_id: str,
-    target_hidden_dim: int,
-    use_medium_volume_bool: bool,
+    gamma_tokens: int = None,  # If None, uses gamma value
+    max_new_tokens: int = 50,
+    similarity_threshold: float = 0.9,
+    max_samples: int = 100,
+    clock_run_bool: bool = False,
+    record_output_bool: bool = False,
+    baseline_only_bool: bool = False,
+    tokens_speculative_bool: bool = False,
+    skip_latent_verification_bool: bool = False,
+    target_model_id: str = "openai-community/gpt2",
+    target_hidden_dim: int = 768,
+    use_medium_volume_bool: bool = False,
 ):
     """
     Core implementation of speculative decoding evaluation.
@@ -169,6 +170,8 @@ def _evaluate_speculative_decoding_impl(
     total_draft_latent_time = 0.0
     total_verify_latent_time = 0.0
     total_speculative_token_time = 0.0
+    total_draft_token_time = 0.0
+    total_target_verify_token_time = 0.0
     total_baseline_latent_time = 0.0
     total_baseline_token_time = 0.0
     per_sample_speculative_times = []
@@ -177,6 +180,12 @@ def _evaluate_speculative_decoding_impl(
     per_sample_speculative_token_times = []
     per_sample_baseline_latent_times = []
     per_sample_baseline_token_times = []
+    per_unit_draft_thought_times = []  # Per individual latent thought (draft model)
+    per_unit_verify_thought_times = []  # Per individual latent thought (target model)
+    per_unit_draft_token_times = []  # Per individual token (draft model)
+    per_unit_target_token_times = []  # Per individual token (target model)
+    per_unit_baseline_thought_times = []  # Per individual latent thought (baseline target model)
+    per_unit_baseline_token_times = []  # Per individual token (baseline target model)
     exact_matches = 0
     total_comparisons = 0
     
@@ -242,6 +251,7 @@ def _evaluate_speculative_decoding_impl(
                     latent_positions,
                     num_latent_thoughts=num_latent_thoughts,
                     gamma=gamma,
+                    gamma_tokens=gamma_tokens,
                     max_new_tokens=max_new_tokens,
                     eos_token_id=eos_token_id,
                     similarity_threshold=similarity_threshold,
@@ -274,11 +284,28 @@ def _evaluate_speculative_decoding_impl(
                 draft_latent_time = stats.get('draft_latent_time', 0.0)
                 verify_latent_time = stats.get('verify_latent_time', 0.0)
                 speculative_token_time = stats.get('token_generation_time', 0.0)
+                draft_token_time = stats.get('draft_token_time', 0.0)
+                target_verify_token_time = stats.get('target_verify_token_time', 0.0)
+                draft_time_per_thought = stats.get('draft_time_per_thought', 0.0)
+                verify_time_per_thought = stats.get('verify_time_per_thought', 0.0)
+                draft_time_per_token = stats.get('draft_time_per_token', 0.0)
+                target_time_per_token = stats.get('target_time_per_token', 0.0)
                 total_speculative_time += speculative_time
                 total_speculative_latent_time += speculative_latent_time
                 total_draft_latent_time += draft_latent_time
                 total_verify_latent_time += verify_latent_time
                 total_speculative_token_time += speculative_token_time
+                total_draft_token_time += draft_token_time
+                total_target_verify_token_time += target_verify_token_time
+                # Track per-unit times (for averaging across samples)
+                if draft_time_per_thought > 0:
+                    per_unit_draft_thought_times.append(draft_time_per_thought)
+                if verify_time_per_thought > 0:
+                    per_unit_verify_thought_times.append(verify_time_per_thought)
+                if draft_time_per_token > 0:
+                    per_unit_draft_token_times.append(draft_time_per_token)
+                if target_time_per_token > 0:
+                    per_unit_target_token_times.append(target_time_per_token)
                 per_sample_speculative_times.append(speculative_time)
                 per_sample_speculative_latent_times.append(speculative_latent_time)
                 per_sample_speculative_token_times.append(speculative_token_time)
@@ -289,7 +316,7 @@ def _evaluate_speculative_decoding_impl(
             # Always run baseline autoregressive decoding (for baseline_only or for comparison)
             # If tokens_speculative=False, we need baseline to compare outputs and timing
             if clock_run_bool or baseline_only_bool or not tokens_speculative_bool:
-                baseline_tokens, latent_thought_time, token_generation_time = baseline_autoregressive_decode(
+                baseline_tokens, latent_thought_time, token_generation_time, latent_time_per_thought, token_time_per_token = baseline_autoregressive_decode(
                     target_model,
                     input_ids,
                     attention_mask,
@@ -308,10 +335,28 @@ def _evaluate_speculative_decoding_impl(
                 per_sample_baseline_latent_times.append(latent_thought_time)
                 per_sample_baseline_token_times.append(token_generation_time)
                 
+                # Track per-unit times for baseline
+                per_unit_baseline_thought_times.append(latent_time_per_thought)
+                per_unit_baseline_token_times.append(token_time_per_token)
+                
                 # Compare outputs if we have both
                 if generated_tokens is not None and baseline_tokens is not None:
+                    # Truncate tokens at EOS token for comparison (don't include tokens after EOS)
+                    def truncate_at_eos(tokens, eos_id):
+                        """Truncate token list at first EOS token (inclusive)"""
+                        try:
+                            eos_index = tokens.index(eos_id)
+                            return tokens[:eos_index + 1]  # Include EOS token
+                        except ValueError:
+                            # EOS not found, return all tokens
+                            return tokens
+                    
+                    # Truncate both token lists at EOS before comparison
+                    spec_tokens_truncated = truncate_at_eos(generated_tokens, eos_token_id)
+                    baseline_tokens_truncated = truncate_at_eos(baseline_tokens, eos_token_id)
+                    
                     total_comparisons += 1
-                    if generated_tokens == baseline_tokens:
+                    if spec_tokens_truncated == baseline_tokens_truncated:
                         exact_matches += 1
                 
                 # For baseline_only, use baseline_tokens as the generated tokens
@@ -325,9 +370,23 @@ def _evaluate_speculative_decoding_impl(
                 
                 # Record outputs if requested
                 if record_output_bool and generated_tokens is not None:
+                    # Truncate tokens at EOS token (don't include tokens after EOS)
+                    def truncate_at_eos(tokens, eos_id):
+                        """Truncate token list at first EOS token (inclusive)"""
+                        try:
+                            eos_index = tokens.index(eos_id)
+                            return tokens[:eos_index + 1]  # Include EOS token
+                        except ValueError:
+                            # EOS not found, return all tokens
+                            return tokens
+                    
+                    # Truncate both token lists at EOS
+                    spec_tokens_truncated = truncate_at_eos(generated_tokens, eos_token_id)
+                    baseline_tokens_truncated = truncate_at_eos(baseline_tokens, eos_token_id)
+                    
                     # Decode tokens to text
-                    spec_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                    baseline_text = tokenizer.decode(baseline_tokens, skip_special_tokens=True)
+                    spec_text = tokenizer.decode(spec_tokens_truncated, skip_special_tokens=True)
+                    baseline_text = tokenizer.decode(baseline_tokens_truncated, skip_special_tokens=True)
                     
                     # Get original question text from dataset
                     original_idx = sample.get("idx", idx)
@@ -341,9 +400,9 @@ def _evaluate_speculative_decoding_impl(
                         "question": question_text,
                         "output_spec_decode": spec_text,
                         "output_standard_decode": baseline_text,
-                        "tokens_spec_decode": generated_tokens,
-                        "tokens_standard_decode": baseline_tokens,
-                        "exact_match": generated_tokens == baseline_tokens,
+                        "tokens_spec_decode": spec_tokens_truncated,
+                        "tokens_standard_decode": baseline_tokens_truncated,
+                        "exact_match": spec_tokens_truncated == baseline_tokens_truncated,
                     })
             
         except Exception as e:
@@ -432,7 +491,31 @@ def _evaluate_speculative_decoding_impl(
         print(f"      - Draft latent thought time: {avg_draft_latent_time:.4f}s per sample ({total_draft_latent_time:.4f}s total)")
         print(f"      - Verify latent thought time: {avg_verify_latent_time:.4f}s per sample ({total_verify_latent_time:.4f}s total)")
         print(f"    Average token generation time: {avg_spec_token_time:.4f}s per sample")
-        print(f"    Total latent thought time: {total_speculative_latent_time:.4f}s")
+        avg_draft_token_time = total_draft_token_time / num_samples if num_samples > 0 else 0.0
+        avg_target_verify_token_time = total_target_verify_token_time / num_samples if num_samples > 0 else 0.0
+        print(f"      - Draft token generation time: {avg_draft_token_time:.4f}s per sample ({total_draft_token_time:.4f}s total)")
+        print(f"      - Target token verification time: {avg_target_verify_token_time:.4f}s per sample ({total_target_verify_token_time:.4f}s total)")
+        
+        # Per-unit timing breakdown (draft model only - target verification is total time)
+        if per_unit_draft_thought_times:
+            avg_draft_per_thought = sum(per_unit_draft_thought_times) / len(per_unit_draft_thought_times)
+            print(f"\n  Per-Unit Timing (Individual Latent Thoughts):")
+            print(f"    Draft model: {avg_draft_per_thought*1000:.3f}ms per latent thought")
+        if per_unit_verify_thought_times:
+            # Target verification is total time for parallel pass, not per-unit
+            avg_verify_total = sum(per_unit_verify_thought_times) / len(per_unit_verify_thought_times) if per_unit_verify_thought_times else 0.0
+            print(f"    Target model: {avg_verify_total*1000:.3f}ms total for parallel verification of all latent thoughts")
+        if per_unit_draft_token_times:
+            avg_draft_per_token = sum(per_unit_draft_token_times) / len(per_unit_draft_token_times)
+            print(f"\n  Per-Unit Timing (Individual Tokens):")
+            print(f"    Draft model: {avg_draft_per_token*1000:.3f}ms per token")
+        if per_unit_target_token_times:
+            # Target verification: each entry is the time for ONE verification call (single forward pass)
+            # that verifies all gamma draft tokens in parallel. There can be multiple rounds.
+            avg_target_per_call = sum(per_unit_target_token_times) / len(per_unit_target_token_times) if per_unit_target_token_times else 0.0
+            print(f"    Target model: {avg_target_per_call*1000:.3f}ms per verification call (single forward pass verifying all gamma tokens in parallel)")
+        
+        print(f"\n    Total latent thought time: {total_speculative_latent_time:.4f}s")
         print(f"    Total token generation time: {total_speculative_token_time:.4f}s")
         
         print(f"\n  Baseline Time Breakdown:")
@@ -440,6 +523,16 @@ def _evaluate_speculative_decoding_impl(
         print(f"    Average token generation time: {avg_base_token_time:.4f}s per sample")
         print(f"    Total latent thought time: {total_baseline_latent_time:.4f}s")
         print(f"    Total token generation time: {total_baseline_token_time:.4f}s")
+        
+        # Per-unit timing breakdown for baseline
+        if per_unit_baseline_thought_times:
+            avg_baseline_per_thought = sum(per_unit_baseline_thought_times) / len(per_unit_baseline_thought_times)
+            print(f"\n  Per-Unit Timing (Baseline - Individual Latent Thoughts):")
+            print(f"    Target model: {avg_baseline_per_thought*1000:.3f}ms per latent thought (single parallel pass)")
+        if per_unit_baseline_token_times:
+            avg_baseline_per_token = sum(per_unit_baseline_token_times) / len(per_unit_baseline_token_times)
+            print(f"\n  Per-Unit Timing (Baseline - Individual Tokens):")
+            print(f"    Target model: {avg_baseline_per_token*1000:.3f}ms per token (autoregressive)")
         
         if avg_baseline_time > 0 and avg_speculative_time > 0:
             actual_speedup = avg_baseline_time / avg_speculative_time
@@ -522,6 +615,8 @@ def _evaluate_speculative_decoding_impl(
             "total_draft_latent_time": total_draft_latent_time,
             "total_verify_latent_time": total_verify_latent_time,
             "total_speculative_token_time": total_speculative_token_time,
+            "total_draft_token_time": total_draft_token_time,
+            "total_target_verify_token_time": total_target_verify_token_time,
             "total_baseline_latent_time": total_baseline_latent_time,
             "total_baseline_token_time": total_baseline_token_time,
             "avg_speculative_time": total_speculative_time / num_samples if num_samples > 0 else 0.0,
@@ -530,6 +625,8 @@ def _evaluate_speculative_decoding_impl(
             "avg_draft_latent_time": total_draft_latent_time / num_samples if num_samples > 0 else 0.0,
             "avg_verify_latent_time": total_verify_latent_time / num_samples if num_samples > 0 else 0.0,
             "avg_speculative_token_time": total_speculative_token_time / num_samples if num_samples > 0 else 0.0,
+            "avg_draft_token_time": total_draft_token_time / num_samples if num_samples > 0 else 0.0,
+            "avg_target_verify_token_time": total_target_verify_token_time / num_samples if num_samples > 0 else 0.0,
             "avg_baseline_latent_time": total_baseline_latent_time / num_samples if num_samples > 0 else 0.0,
             "avg_baseline_token_time": total_baseline_token_time / num_samples if num_samples > 0 else 0.0,
             "overall_speedup": actual_speedup,
@@ -573,7 +670,7 @@ def _evaluate_speculative_decoding_impl(
 
 @app.function(
     image=image,
-    gpu="A100-80GB:1",
+    gpu="A100:1",
     timeout=60 * 60 * 4,  # 4 hours
     volumes={"/checkpoints": checkpoint_volume_medium},
 )
@@ -583,6 +680,7 @@ def evaluate_speculative_decoding_medium(
     data_path: str = "data/prontoqa_test.json",
     num_latent_thoughts: int = 6,
     gamma: int = 6,
+    gamma_tokens: int = None,  # If None, uses gamma value
     max_new_tokens: int = 50,
     similarity_threshold: float = 0.9,
     max_samples: int = 100,
@@ -600,7 +698,8 @@ def evaluate_speculative_decoding_medium(
         target_checkpoint_path: Path to target (Coconut) model checkpoint in gpt2-medium volume
         data_path: Path to test data JSON file (default "data/prontoqa_test.json")
         num_latent_thoughts: Number of latent thoughts to generate (default 6)
-        gamma: Number of draft tokens per round (default 6)
+        gamma: Number of draft tokens per round (default 6, kept for backward compatibility)
+        gamma_tokens: Number of draft tokens per round for token generation. If None, uses gamma value (default None)
         max_new_tokens: Maximum new tokens to generate (default 50)
         similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
         max_samples: Maximum number of samples to evaluate (default 100)
@@ -638,6 +737,7 @@ def evaluate_speculative_decoding_medium(
         data_path=data_path,
         num_latent_thoughts=num_latent_thoughts,
         gamma=gamma,
+        gamma_tokens=gamma_tokens,
         max_new_tokens=max_new_tokens,
         similarity_threshold=similarity_threshold,
         max_samples=max_samples,
@@ -667,6 +767,7 @@ def evaluate_speculative_decoding(
     data_path: str = "data/prontoqa_test.json",
     num_latent_thoughts: int = 6,
     gamma: int = 6,
+    gamma_tokens: int = None,  # If None, uses gamma value
     max_new_tokens: int = 50,
     similarity_threshold: float = 0.9,
     max_samples: int = 100,
@@ -684,7 +785,8 @@ def evaluate_speculative_decoding(
         target_checkpoint_path: Path to target (Coconut) model checkpoint
         data_path: Path to test data JSON file
         num_latent_thoughts: Number of latent thoughts to generate (default 6)
-        gamma: Number of draft tokens per round (default 6)
+        gamma: Number of draft tokens per round (default 6, kept for backward compatibility)
+        gamma_tokens: Number of draft tokens per round for token generation. If None, uses gamma value (default None)
         max_new_tokens: Maximum new tokens to generate (default 50)
         similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
         max_samples: Maximum number of samples to evaluate (default 100)
@@ -722,6 +824,7 @@ def evaluate_speculative_decoding(
         data_path=data_path,
         num_latent_thoughts=num_latent_thoughts,
         gamma=gamma,
+        gamma_tokens=gamma_tokens,
         max_new_tokens=max_new_tokens,
         similarity_threshold=similarity_threshold,
         max_samples=max_samples,
@@ -737,6 +840,184 @@ def evaluate_speculative_decoding(
     
     # Commit volume
     checkpoint_volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu="A100:1",
+    timeout=60 * 60 * 4,  # 4 hours
+    volumes={"/checkpoints": checkpoint_volume},
+)
+def evaluate_speculative_decoding_mse(
+    draft_checkpoint_path: str,
+    target_checkpoint_path: str,
+    data_path: str = "data/prontoqa_test.json",
+    num_latent_thoughts: int = 6,
+    gamma: int = 6,
+    gamma_tokens: int = None,  # If None, uses gamma value
+    max_new_tokens: int = 50,
+    similarity_threshold: float = 0.9,
+    max_samples: int = 100,
+    clock_run: str = "False",
+    record_output: str = "False",
+    baseline_only: str = "False",
+    tokens_speculative: str = "False",
+    skip_latent_verification: str = "False",
+):
+    """
+    Evaluate speculative decoding with MSE-trained draft model (standard gpt2).
+    This function is identical to evaluate_speculative_decoding but with a different name
+    for clarity when evaluating MSE-trained models.
+    
+    Args:
+        draft_checkpoint_path: Path to MSE-trained draft model checkpoint in Modal volume
+        target_checkpoint_path: Path to target (Coconut) model checkpoint
+        data_path: Path to test data JSON file
+        num_latent_thoughts: Number of latent thoughts to generate (default 6)
+        gamma: Number of draft tokens per round (default 6, kept for backward compatibility)
+        gamma_tokens: Number of draft tokens per round for token generation. If None, uses gamma value (default None)
+        max_new_tokens: Maximum new tokens to generate (default 50)
+        similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
+        max_samples: Maximum number of samples to evaluate (default 100)
+        clock_run: Enable wallclock timing. Accepts "True", "true", "1", "False", "false", "0" (default "False")
+        record_output: Record generated outputs for comparison. Requires clock_run=True. Accepts "True", "true", "1", etc. (default "False")
+        baseline_only: Only run baseline (target model) decoding, skip speculative decoding. Accepts "True", "true", "1", etc. (default "False")
+        tokens_speculative: If True, use speculative decoding for tokens. If False, use autoregressive generation with target model only after latent thoughts. Accepts "True", "true", "1", etc. (default "False")
+        skip_latent_verification: If True, skip target model verification of latent thoughts (use draft only). Much faster. Accepts "True", "true", "1", etc. (default "False")
+    """
+    # Parse string parameters to boolean
+    clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
+    record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
+    baseline_only_bool = baseline_only.lower() in ("true", "1", "yes", "on")
+    tokens_speculative_bool = tokens_speculative.lower() in ("true", "1", "yes", "on")
+    skip_latent_verification_bool = skip_latent_verification.lower() in ("true", "1", "yes", "on")
+    
+    # If baseline_only is True, clock_run must also be True
+    if baseline_only_bool:
+        clock_run_bool = True
+        print("⚠️  Note: baseline_only=True implies clock_run=True")
+    
+    # If tokens_speculative is False, we need baseline comparison, so enable clock_run
+    if not tokens_speculative_bool:
+        clock_run_bool = True
+        print("⚠️  Note: tokens_speculative=False implies clock_run=True (for baseline comparison)")
+    
+    if record_output_bool and not clock_run_bool:
+        print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
+        record_output_bool = False
+    
+    # Call the implementation
+    use_medium_volume_bool = _evaluate_speculative_decoding_impl(
+        draft_checkpoint_path=draft_checkpoint_path,
+        target_checkpoint_path=target_checkpoint_path,
+        data_path=data_path,
+        num_latent_thoughts=num_latent_thoughts,
+        gamma=gamma,
+        gamma_tokens=gamma_tokens,
+        max_new_tokens=max_new_tokens,
+        similarity_threshold=similarity_threshold,
+        max_samples=max_samples,
+        clock_run_bool=clock_run_bool,
+        record_output_bool=record_output_bool,
+        baseline_only_bool=baseline_only_bool,
+        tokens_speculative_bool=tokens_speculative_bool,
+        skip_latent_verification_bool=skip_latent_verification_bool,
+        target_model_id="openai-community/gpt2",
+        target_hidden_dim=768,
+        use_medium_volume_bool=False,
+    )
+    
+    # Commit volume
+    checkpoint_volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB:1",
+    timeout=60 * 60 * 4,  # 4 hours
+    volumes={"/checkpoints": checkpoint_volume_medium},
+)
+def evaluate_speculative_decoding_medium_mse(
+    draft_checkpoint_path: str,
+    target_checkpoint_path: str,
+    data_path: str = "data/prontoqa_test.json",
+    num_latent_thoughts: int = 6,
+    gamma: int = 6,
+    gamma_tokens: int = None,  # If None, uses gamma value
+    max_new_tokens: int = 50,
+    similarity_threshold: float = 0.9,
+    max_samples: int = 100,
+    clock_run: str = "True",
+    record_output: str = "False",
+    baseline_only: str = "False",
+    tokens_speculative: str = "False",
+    skip_latent_verification: str = "False",
+):
+    """
+    Evaluate speculative decoding with MSE-trained draft model (gpt2-medium models, uses medium volume).
+    This function is identical to evaluate_speculative_decoding_medium but with a different name
+    for clarity when evaluating MSE-trained models.
+    
+    Args:
+        draft_checkpoint_path: Path to MSE-trained draft model checkpoint in gpt2-medium Modal volume
+        target_checkpoint_path: Path to target (Coconut) model checkpoint in gpt2-medium volume
+        data_path: Path to test data JSON file (default "data/prontoqa_test.json")
+        num_latent_thoughts: Number of latent thoughts to generate (default 6)
+        gamma: Number of draft tokens per round (default 6, kept for backward compatibility)
+        gamma_tokens: Number of draft tokens per round for token generation. If None, uses gamma value (default None)
+        max_new_tokens: Maximum new tokens to generate (default 50)
+        similarity_threshold: Cosine similarity threshold for latent thoughts (default 0.9)
+        max_samples: Maximum number of samples to evaluate (default 100)
+        clock_run: Enable wallclock timing (default "True" for medium eval)
+        record_output: Record generated outputs for comparison (default "False")
+        baseline_only: Only run baseline (target model) decoding (default "False")
+        tokens_speculative: If False, use autoregressive generation with target model only after latent thoughts (default "False")
+        skip_latent_verification: If True, skip target model verification of latent thoughts (default "False")
+    """
+    # Parse string parameters to boolean
+    clock_run_bool = clock_run.lower() in ("true", "1", "yes", "on")
+    record_output_bool = record_output.lower() in ("true", "1", "yes", "on")
+    baseline_only_bool = baseline_only.lower() in ("true", "1", "yes", "on")
+    tokens_speculative_bool = tokens_speculative.lower() in ("true", "1", "yes", "on")
+    skip_latent_verification_bool = skip_latent_verification.lower() in ("true", "1", "yes", "on")
+    
+    # If baseline_only is True, clock_run must also be True
+    if baseline_only_bool:
+        clock_run_bool = True
+        print("⚠️  Note: baseline_only=True implies clock_run=True")
+    
+    # If tokens_speculative is False, we need baseline comparison, so enable clock_run
+    if not tokens_speculative_bool:
+        clock_run_bool = True
+        print("⚠️  Note: tokens_speculative=False implies clock_run=True (for baseline comparison)")
+    
+    if record_output_bool and not clock_run_bool:
+        print("⚠️  Warning: record_output requires clock_run=True. Disabling record_output.")
+        record_output_bool = False
+    
+    # Call the implementation
+    use_medium_volume_bool = _evaluate_speculative_decoding_impl(
+        draft_checkpoint_path=draft_checkpoint_path,
+        target_checkpoint_path=target_checkpoint_path,
+        data_path=data_path,
+        num_latent_thoughts=num_latent_thoughts,
+        gamma=gamma,
+        gamma_tokens=gamma_tokens,
+        max_new_tokens=max_new_tokens,
+        similarity_threshold=similarity_threshold,
+        max_samples=max_samples,
+        clock_run_bool=clock_run_bool,
+        record_output_bool=record_output_bool,
+        baseline_only_bool=baseline_only_bool,
+        tokens_speculative_bool=tokens_speculative_bool,
+        skip_latent_verification_bool=skip_latent_verification_bool,
+        target_model_id="openai-community/gpt2-medium",
+        target_hidden_dim=1024,
+        use_medium_volume_bool=True,
+    )
+    
+    # Commit volume
+    checkpoint_volume_medium.commit()
 
 
 @app.local_entrypoint()
