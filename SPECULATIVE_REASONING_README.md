@@ -321,7 +321,7 @@ Collect latent thought vectors and logits from the trained GPT2-medium Coconut m
 
 ```bash
 modal run modal_data_collection.py::collect_draft_training_data_medium \
-  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25' \
+  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_50' \
   --output-filename 'prontoqa_train_draft_training_data_medium.json' \
   --max-samples 500 \
   --data-path 'data/prontoqa_train.json'
@@ -331,7 +331,7 @@ modal run modal_data_collection.py::collect_draft_training_data_medium \
 
 ```bash
 modal run modal_data_collection.py::collect_draft_training_data_medium \
-  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25' \
+  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_50' \
   --output-filename 'prontoqa_valid_draft_training_data_medium.json' \
   --max-samples 500 \
   --data-path 'data/prontoqa_valid.json'
@@ -566,12 +566,12 @@ modal run modal_coconut_training.py::train_prontoqa_coconut_medium
 
 # 2. Collect draft training data
 modal run modal_data_collection.py::collect_draft_training_data_medium \
-  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25' \
+  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_50' \
   --output-filename 'prontoqa_train_draft_training_data_medium.json' \
   --data-path 'data/prontoqa_train.json'
 
 modal run modal_data_collection.py::collect_draft_training_data_medium \
-  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_25' \
+  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium/checkpoint_50' \
   --output-filename 'prontoqa_valid_draft_training_data_medium.json' \
   --data-path 'data/prontoqa_valid.json'
 
@@ -605,8 +605,7 @@ modal run modal_speculative_decode.py::evaluate_speculative_decoding_medium \
 modal run modal_download.py::list_available_checkpoints
 
 # List checkpoints (GPT2-medium)
-modal run modal_download.py::list_checkpoints_in_path_medium \
-  --checkpoint-path '/checkpoints/gpt2medium-prontoqa-checkpoints/prontoqa-coconut-gpt2-medium'
+modal run modal_download.py::list_checkpoints_in_path_medium
 
 # Download results (standard GPT2)
 python download_results.py --volume-name "coconut-checkpoints"
