@@ -253,7 +253,7 @@ def train_draft_model_medium(
     
     # Create config
     config = {
-        "model_id": "erwanf/gpt2-mini",  # Draft model is still small
+        "model_id": "erwanf/gpt2-mini",
         "teacher_hidden_dim": 1024,  # gpt2-medium has 1024 hidden dim
         "data_json_path": data_json_path,
         "data_dir": draft_data_dir,
