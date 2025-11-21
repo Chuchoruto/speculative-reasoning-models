@@ -30,9 +30,10 @@ def compute_loss(
     kl_weight=1.0,
     cosine_weight=1.0,
     temperature=1.0,
+    loss_type="cosine",  # "cosine" or "mse"
 ):
     """
-    Compute mixed loss: KL divergence for logits + Cosine similarity for latent thoughts.
+    Compute mixed loss: KL divergence for logits + Cosine similarity or MSE for latent thoughts.
     
     Args:
         student_logits: Student model logits [batch, seq, vocab]
@@ -41,16 +42,19 @@ def compute_loss(
         teacher_latent_thoughts_list: Teacher latent thoughts per sample
         target_positions_list: Target positions per sample
         kl_weight: Weight for KL divergence loss
-        cosine_weight: Weight for cosine similarity loss (1 - cosine_sim)
+        cosine_weight: Weight for latent thought loss (cosine similarity or MSE)
         temperature: Temperature for softmax in KL divergence
+        loss_type: Type of loss for latent thoughts - "cosine" or "mse"
     """
     batch_size = student_logits.shape[0]
     device = student_logits.device
     
     total_kl_loss = 0.0
     total_cosine_loss = 0.0
+    total_mse_loss = 0.0
     num_kl_samples = 0
     num_cosine_samples = 0
+    num_mse_samples = 0
     
     # Process each sample in the batch
     for batch_idx in range(batch_size):
@@ -83,15 +87,29 @@ def compute_loss(
         
         # Apply temperature scaling
         teacher_log_probs = F.log_softmax(teacher_logits_aligned / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_logits_aligned / temperature, dim=-1)
+        student_log_probs = F.log_softmax(student_logits_aligned / temperature, dim=-1)
         student_probs = F.softmax(student_logits_aligned / temperature, dim=-1)
         
-        # KL divergence: KL(student logits || teacher logits) - reverse KL
-        kl_loss = F.kl_div(
-            teacher_log_probs,
-            student_probs,
-            reduction='batchmean',
-            log_target=False
-        )
+        # KL divergence: 
+        # - For MSE loss: use forward KL = KL(student || teacher)
+        # - For cosine loss: use reverse KL = KL(teacher || student)
+        if loss_type == "mse":
+            # Forward KL: KL(student || teacher)
+            kl_loss = F.kl_div(
+                student_log_probs,
+                teacher_probs,
+                reduction='batchmean',
+                log_target=False
+            )
+        else:
+            # Reverse KL: KL(teacher || student)
+            kl_loss = F.kl_div(
+                teacher_log_probs,
+                student_probs,
+                reduction='batchmean',
+                log_target=False
+            )
         
         total_kl_loss += (kl_loss * (temperature ** 2))
         num_kl_samples += 1
@@ -120,18 +138,25 @@ def compute_loss(
                         student_aligned = student_latents_stacked[:min_latent_len]  # [min_len, hidden_dim]
                         teacher_aligned = teacher_latents[:min_latent_len]  # [min_len, hidden_dim]
                         
-                        # Cosine similarity loss: 1 - cosine_similarity (minimize distance, maximize similarity)
-                        # Compute cosine similarity per latent thought
-                        cosine_sims = F.cosine_similarity(
-                            student_aligned, 
-                            teacher_aligned, 
-                            dim=-1
-                        )  # [min_len] - one similarity per latent thought
-                        
-                        # Loss is 1 - cosine_similarity (ranges from 0 to 2, 0 when identical)
-                        cosine_loss = (1.0 - cosine_sims).mean()
-                        total_cosine_loss += cosine_loss
-                        num_cosine_samples += 1
+                        # Latent thought loss: Cosine similarity or MSE
+                        if loss_type == "mse":
+                            # MSE loss: mean squared error between student and teacher latent thoughts
+                            mse_loss = F.mse_loss(student_aligned, teacher_aligned, reduction='mean')
+                            total_mse_loss += mse_loss
+                            num_mse_samples += 1
+                        else:  # Default to cosine
+                            # Cosine similarity loss: 1 - cosine_similarity (minimize distance, maximize similarity)
+                            # Compute cosine similarity per latent thought
+                            cosine_sims = F.cosine_similarity(
+                                student_aligned, 
+                                teacher_aligned, 
+                                dim=-1
+                            )  # [min_len] - one similarity per latent thought
+                            
+                            # Loss is 1 - cosine_similarity (ranges from 0 to 2, 0 when identical)
+                            cosine_loss = (1.0 - cosine_sims).mean()
+                            total_cosine_loss += cosine_loss
+                            num_cosine_samples += 1
                 except Exception as e:
                     # Skip if stacking fails (e.g., empty list or shape mismatch)
                     pass
@@ -139,19 +164,28 @@ def compute_loss(
     # Average losses
     avg_kl_loss = total_kl_loss / num_kl_samples if num_kl_samples > 0 else torch.tensor(0.0, device=device)
     avg_cosine_loss = total_cosine_loss / num_cosine_samples if num_cosine_samples > 0 else torch.tensor(0.0, device=device)
+    avg_mse_loss = total_mse_loss / num_mse_samples if num_mse_samples > 0 else torch.tensor(0.0, device=device)
     
-    # Combined loss (only KL + Cosine)
-    total_loss = (
-        kl_weight * avg_kl_loss +
-        cosine_weight * avg_cosine_loss
-    )
+    # Combined loss: KL + (Cosine or MSE)
+    if loss_type == "mse":
+        total_loss = (
+            kl_weight * avg_kl_loss +
+            cosine_weight * avg_mse_loss
+        )
+    else:  # cosine
+        total_loss = (
+            kl_weight * avg_kl_loss +
+            cosine_weight * avg_cosine_loss
+        )
     
     return {
         'total_loss': total_loss,
         'kl_loss': avg_kl_loss,
-        'cosine_loss': avg_cosine_loss,
+        'cosine_loss': avg_cosine_loss if loss_type == "cosine" else torch.tensor(0.0, device=device),
+        'mse_loss': avg_mse_loss if loss_type == "mse" else torch.tensor(0.0, device=device),
         'num_kl_samples': num_kl_samples,
-        'num_cosine_samples': num_cosine_samples,
+        'num_cosine_samples': num_cosine_samples if loss_type == "cosine" else 0,
+        'num_mse_samples': num_mse_samples if loss_type == "mse" else 0,
     }
 
 
@@ -170,6 +204,7 @@ def train_epoch(
     gradient_accumulation_steps=1,
     lr_scheduler=None,
     current_epoch=0,
+    loss_type="cosine",
 ):
     """Train for one epoch with gradient accumulation."""
     model.train()
@@ -187,6 +222,7 @@ def train_epoch(
     total_ce = 0.0
     total_kl = 0.0
     total_cosine = 0.0
+    total_mse = 0.0
     num_batches = 0
     
     # Only show progress bar on rank 0
@@ -238,6 +274,7 @@ def train_epoch(
             kl_weight=kl_weight,
             cosine_weight=cosine_weight,
             temperature=temperature,
+            loss_type=loss_type,
         )
         
         loss = loss_dict['total_loss']
@@ -252,7 +289,10 @@ def train_epoch(
         unscaled_loss = loss.item() * effective_grad_accum_steps
         total_loss += unscaled_loss
         total_kl += loss_dict['kl_loss'].item()
-        total_cosine += loss_dict['cosine_loss'].item()
+        if loss_type == "mse":
+            total_mse += loss_dict['mse_loss'].item()
+        else:
+            total_cosine += loss_dict['cosine_loss'].item()
         num_batches += 1
         
         # Update weights every effective_grad_accum_steps batches
@@ -273,32 +313,58 @@ def train_epoch(
             global_step += 1
             
             # Update progress bar
-            pbar.set_postfix({
-                'loss': unscaled_loss,
-                'kl': loss_dict['kl_loss'].item(),
-                'cos': loss_dict['cosine_loss'].item(),
-                'step': global_step,
-            })
+            if loss_type == "mse":
+                pbar.set_postfix({
+                    'loss': unscaled_loss,
+                    'kl': loss_dict['kl_loss'].item(),
+                    'mse': loss_dict['mse_loss'].item(),
+                    'step': global_step,
+                })
+            else:
+                pbar.set_postfix({
+                    'loss': unscaled_loss,
+                    'kl': loss_dict['kl_loss'].item(),
+                    'cos': loss_dict['cosine_loss'].item(),
+                    'step': global_step,
+                })
             
             # Log to wandb
             if wandb_run is not None:
-                wandb_run.log({
+                log_dict = {
                     'train/loss': unscaled_loss,
                     'train/kl_loss': loss_dict['kl_loss'].item(),
-                    'train/cosine_loss': loss_dict['cosine_loss'].item(),
-                    'train/num_kl_samples': loss_dict['num_kl_samples'],
-                    'train/num_cosine_samples': loss_dict['num_cosine_samples'],
                     'train/learning_rate': optimizer.param_groups[0]['lr'],
                     'train/step': global_step,
-                })
+                }
+                if loss_type == "mse":
+                    log_dict.update({
+                        'train/mse_loss': loss_dict['mse_loss'].item(),
+                        'train/num_kl_samples': loss_dict['num_kl_samples'],
+                        'train/num_mse_samples': loss_dict['num_mse_samples'],
+                    })
+                else:
+                    log_dict.update({
+                        'train/cosine_loss': loss_dict['cosine_loss'].item(),
+                        'train/num_kl_samples': loss_dict['num_kl_samples'],
+                        'train/num_cosine_samples': loss_dict['num_cosine_samples'],
+                    })
+                wandb_run.log(log_dict)
         else:
             # Just update progress bar without logging to wandb
-            pbar.set_postfix({
-                'loss': unscaled_loss,
-                'kl': loss_dict['kl_loss'].item(),
-                'cos': loss_dict['cosine_loss'].item(),
-                'acc': f'{(batch_idx + 1) % effective_grad_accum_steps}/{effective_grad_accum_steps}',
-            })
+            if loss_type == "mse":
+                pbar.set_postfix({
+                    'loss': unscaled_loss,
+                    'kl': loss_dict['kl_loss'].item(),
+                    'mse': loss_dict['mse_loss'].item(),
+                    'acc': f'{(batch_idx + 1) % effective_grad_accum_steps}/{effective_grad_accum_steps}',
+                })
+            else:
+                pbar.set_postfix({
+                    'loss': unscaled_loss,
+                    'kl': loss_dict['kl_loss'].item(),
+                    'cos': loss_dict['cosine_loss'].item(),
+                    'acc': f'{(batch_idx + 1) % effective_grad_accum_steps}/{effective_grad_accum_steps}',
+                })
     
     # Handle remaining gradients if num_batches is not divisible by effective_grad_accum_steps
     if num_batches % effective_grad_accum_steps != 0:
@@ -317,11 +383,15 @@ def train_epoch(
         
         global_step += 1
     
-    return {
+    result = {
         'avg_loss': total_loss / num_batches,
         'avg_kl': total_kl / num_batches,
-        'avg_cosine': total_cosine / num_batches,
-    }, global_step
+    }
+    if loss_type == "mse":
+        result['avg_mse'] = total_mse / num_batches
+    else:
+        result['avg_cosine'] = total_cosine / num_batches
+    return result, global_step
 
 
 def validate_epoch(
@@ -336,12 +406,14 @@ def validate_epoch(
     rank=0,
     world_size=1,
     num_samples_to_show=3,
+    loss_type="cosine",
 ):
     """Validate for one epoch (no gradient updates) with exact match accuracy."""
     model.eval()
     total_loss = 0.0
     total_kl = 0.0
     total_cosine = 0.0
+    total_mse = 0.0
     num_batches = 0
     
     # For exact match accuracy
@@ -391,6 +463,7 @@ def validate_epoch(
                 kl_weight=kl_weight,
                 cosine_weight=cosine_weight,
                 temperature=temperature,
+                loss_type=loss_type,
             )
             
             loss = loss_dict['total_loss']
@@ -398,7 +471,10 @@ def validate_epoch(
             # Update metrics
             total_loss += loss.item()
             total_kl += loss_dict['kl_loss'].item()
-            total_cosine += loss_dict['cosine_loss'].item()
+            if loss_type == "mse":
+                total_mse += loss_dict['mse_loss'].item()
+            else:
+                total_cosine += loss_dict['cosine_loss'].item()
             num_batches += 1
             
             # Compute exact match accuracy
@@ -457,12 +533,20 @@ def validate_epoch(
             
             # Update progress bar
             current_accuracy = exact_matches / total_token_predictions if total_token_predictions > 0 else 0.0
-            pbar.set_postfix({
-                'loss': loss.item(),
-                'kl': loss_dict['kl_loss'].item(),
-                'cos': loss_dict['cosine_loss'].item(),
-                'acc': f'{current_accuracy:.2%}',
-            })
+            if loss_type == "mse":
+                pbar.set_postfix({
+                    'loss': loss.item(),
+                    'kl': loss_dict['kl_loss'].item(),
+                    'mse': loss_dict['mse_loss'].item(),
+                    'acc': f'{current_accuracy:.2%}',
+                })
+            else:
+                pbar.set_postfix({
+                    'loss': loss.item(),
+                    'kl': loss_dict['kl_loss'].item(),
+                    'cos': loss_dict['cosine_loss'].item(),
+                    'acc': f'{current_accuracy:.2%}',
+                })
     
     # Calculate final accuracy
     exact_match_accuracy = exact_matches / total_token_predictions if total_token_predictions > 0 else 0.0
@@ -482,14 +566,18 @@ def validate_epoch(
             print(f"  Exact Match: {'✓' if sample['exact_match'] else '✗'}")
         print("="*80 + "\n")
     
-    return {
+    result = {
         'avg_loss': total_loss / num_batches,
         'avg_kl': total_kl / num_batches,
-        'avg_cosine': total_cosine / num_batches,
         'exact_match_accuracy': exact_match_accuracy,
         'exact_matches': exact_matches,
         'total_predictions': total_token_predictions,
     }
+    if loss_type == "mse":
+        result['avg_mse'] = total_mse / num_batches
+    else:
+        result['avg_cosine'] = total_cosine / num_batches
+    return result
 
 
 def main():
@@ -688,10 +776,15 @@ def main():
     kl_weight = config.get('kl_weight', 1.0)
     cosine_weight = config.get('cosine_weight', 1.0)
     temperature = config.get('temperature', 1.0)
+    loss_type = config.get('loss_type', 'cosine')  # 'cosine' or 'mse'
     
     if rank == 0:
         print(f"\nStarting training for {num_epochs} epochs...")
-        print(f"Loss weights: KL={kl_weight}, Cosine={cosine_weight}")
+        if loss_type == "mse":
+            print(f"Loss weights: KL={kl_weight}, MSE={cosine_weight}")
+        else:
+            print(f"Loss weights: KL={kl_weight}, Cosine={cosine_weight}")
+        print(f"Loss type: {loss_type}")
         print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
         print(f"Warmup steps: {warmup_steps}")
         print(f"Warmup peak LR: {peak_lr}")
@@ -723,11 +816,16 @@ def main():
             gradient_accumulation_steps=gradient_accumulation_steps,
             lr_scheduler=lr_scheduler,
             current_epoch=epoch,
+            loss_type=loss_type,
         )
         
         if rank == 0:
-            print(f"Epoch {epoch + 1} - Train Loss: {train_metrics['avg_loss']:.4f}, "
-                  f"KL: {train_metrics['avg_kl']:.4f}, Cosine: {train_metrics['avg_cosine']:.4f}")
+            if loss_type == "mse":
+                print(f"Epoch {epoch + 1} - Train Loss: {train_metrics['avg_loss']:.4f}, "
+                      f"KL: {train_metrics['avg_kl']:.4f}, MSE: {train_metrics['avg_mse']:.4f}")
+            else:
+                print(f"Epoch {epoch + 1} - Train Loss: {train_metrics['avg_loss']:.4f}, "
+                      f"KL: {train_metrics['avg_kl']:.4f}, Cosine: {train_metrics['avg_cosine']:.4f}")
         
         # Validation
         val_metrics = None
@@ -746,11 +844,16 @@ def main():
                 rank=rank,
                 world_size=world_size,
                 num_samples_to_show=3,
+                loss_type=loss_type,
             )
             
             if rank == 0:
-                print(f"Epoch {epoch + 1} - Val Loss: {val_metrics['avg_loss']:.4f}, "
-                      f"KL: {val_metrics['avg_kl']:.4f}, Cosine: {val_metrics['avg_cosine']:.4f}")
+                if loss_type == "mse":
+                    print(f"Epoch {epoch + 1} - Val Loss: {val_metrics['avg_loss']:.4f}, "
+                          f"KL: {val_metrics['avg_kl']:.4f}, MSE: {val_metrics['avg_mse']:.4f}")
+                else:
+                    print(f"Epoch {epoch + 1} - Val Loss: {val_metrics['avg_loss']:.4f}, "
+                          f"KL: {val_metrics['avg_kl']:.4f}, Cosine: {val_metrics['avg_cosine']:.4f}")
                 print(f"Epoch {epoch + 1} - Val Exact Match Accuracy: {val_metrics['exact_match_accuracy']:.2%} "
                       f"({val_metrics['exact_matches']}/{val_metrics['total_predictions']})")
         
@@ -760,15 +863,22 @@ def main():
                 'epoch': epoch + 1,
                 'epoch/train_loss': train_metrics['avg_loss'],
                 'epoch/train_kl_loss': train_metrics['avg_kl'],
-                'epoch/train_cosine_loss': train_metrics['avg_cosine'],
             }
+            if loss_type == "mse":
+                log_dict['epoch/train_mse_loss'] = train_metrics['avg_mse']
+            else:
+                log_dict['epoch/train_cosine_loss'] = train_metrics['avg_cosine']
+            
             if val_metrics is not None:
                 log_dict.update({
                     'epoch/val_loss': val_metrics['avg_loss'],
                     'epoch/val_kl_loss': val_metrics['avg_kl'],
-                    'epoch/val_cosine_loss': val_metrics['avg_cosine'],
                     'epoch/val_exact_match_accuracy': val_metrics['exact_match_accuracy'],
                 })
+                if loss_type == "mse":
+                    log_dict['epoch/val_mse_loss'] = val_metrics['avg_mse']
+                else:
+                    log_dict['epoch/val_cosine_loss'] = val_metrics['avg_cosine']
             wandb_run.log(log_dict)
         
         # Update learning rate schedulers
