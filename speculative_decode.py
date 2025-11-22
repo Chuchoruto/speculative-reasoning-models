@@ -791,6 +791,14 @@ def speculative_decode(
         draft_latent_time = draft_gen_end - draft_gen_start
         verify_latent_time = 0.0  # No verification
         verification_logits = None  # No verification, so no logits
+
+        # Per-thought timings (approximate by dividing total time across latent thoughts)
+        # If no latent thoughts collected, fall back to 0 to avoid division issues
+        num_verified_thoughts = len(target_thoughts) if len(target_thoughts) > 0 else num_latent_thoughts
+        draft_time_per_thought = (
+            draft_latent_time / num_verified_thoughts if num_verified_thoughts > 0 else 0.0
+        )
+        verify_time_per_thought = 0.0
     else:
         # Generate and verify with both models
         acceptance_list, draft_thoughts, target_thoughts, draft_latent_time, verify_latent_time, draft_time_per_thought, verify_time_per_thought, verification_logits = speculative_decode_latent_thoughts(
