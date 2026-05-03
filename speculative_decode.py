@@ -464,7 +464,7 @@ def speculative_decode_tokens(
             draft_token_times_this_round.append(draft_token_end - draft_token_start)
 
             # Stop drafting further tokens in this round if EOS is generated.
-            # Once <|endoftext|> is proposed, any additional draft tokens would be discarded
+            # Once endoftext token is proposed, any additional draft tokens would be discarded
             # regardless of whether the EOS token is ultimately accepted or rejected.
             if eos_token_id is not None and draft_token == eos_token_id:
                 draft_reached_eos = True
